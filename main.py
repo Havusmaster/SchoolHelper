@@ -1,177 +1,273 @@
-# SchoolBot — с автозагрузкой зависимостей
+import logging
 import os
-import subprocess
-import sys
-
-# Автоустановка зависимостей
-def install_requirements():
-    if not os.path.exists('requirements.txt'):
-        return
-    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-r', 'requirements.txt'])
-
-install_requirements()
-
-# Теперь импортируем
-import logging, re, sqlite3, requests
-from datetime import datetime
 from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, CallbackQueryHandler
+import easyocr
+import requests
 from PIL import Image
-import io, easyocr
-from sympy import symbols, Eq, solve, Poly
+import io
+from sympy import symbols, Eq, solve, simplify, Poly, sqrt
+from sympy.solvers import solve as sym_solve
 from sympy.parsing.sympy_parser import parse_expr, standard_transformations, implicit_multiplication_application, convert_xor
-from flask import Flask
-from threading import Thread
+import sqlite3
+from datetime import datetime, timedelta
+import re
 
+# Загружаем .env
 load_dotenv()
+
+# TOKEN
 TOKEN = os.getenv('TOKEN')
+
+# Конфиг из .env
 DAILY_LIMIT = int(os.getenv('DAILY_LIMIT', 3))
 REFERRAL_REWARD = int(os.getenv('REFERRAL_REWARD', 1))
 
-logging.basicConfig(level=logging.INFO)
+if not TOKEN:
+    raise ValueError("TOKEN не найден в .env!")
+
+# Логи
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# EasyOCR reader
 reader = easyocr.Reader(['ru', 'en'], gpu=False)
 
-conn = sqlite3.connect('users.db', check_same_thread=False)
-c = conn.cursor()
-c.execute('CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, daily_count INTEGER DEFAULT 0, last_date TEXT, extra_tasks INTEGER DEFAULT 0)')
-c.execute('CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY, user_id INTEGER, ts TEXT, eq TEXT, sol TEXT)')
+# База данных SQLite
+conn = sqlite3.connect('users.db')
+cursor = conn.cursor()
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    daily_count INTEGER DEFAULT 0,
+    last_date TEXT,
+    extra_tasks INTEGER DEFAULT 0
+)
+''')
+try:
+    cursor.execute("ALTER TABLE users ADD COLUMN extra_tasks INTEGER DEFAULT 0")
+    conn.commit()
+except sqlite3.OperationalError:
+    pass  # Колонка уже существует
+
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    timestamp TEXT,
+    equation TEXT,
+    solution TEXT
+)
+''')
 conn.commit()
 
-# === ВСЁ ОСТАЛЬНОЕ — ТОТ ЖЕ КОД, ЧТО БЫЛ РАНЬШЕ ===
-# (вставь сюда весь код от def get_user(...) и до конца)
-
-# ВСТАВЬ СЮДА ВЕСЬ КОД ОТ "def get_user" ДО "app.run_polling()"
-# (я сократил, чтобы не повторяться — скопируй из прошлого сообщения)
-
-# ------------------- ВСТАВЬ СЮДА -------------------
-def get_user(user_id):
+# Функция: Получить/обновить пользователя
+def get_user_level(user_id):
     today = datetime.now().strftime('%Y-%m-%d')
-    c.execute('SELECT daily_count, last_date, extra_tasks FROM users WHERE user_id=?', (user_id,))
-    row = c.fetchone()
+    cursor.execute('SELECT daily_count, last_date, extra_tasks FROM users WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
+    extra_tasks = 0
+    count = 0
     if row:
-        count, last, extra = row
-        if last != today:
-            count, extra = 0, extra
-            c.execute('UPDATE users SET daily_count=0, last_date=? WHERE user_id=?', (today, user_id))
+        count, last_date, extra_tasks = row
+        if last_date != today:
+            count = 0
+            cursor.execute('UPDATE users SET daily_count = 0, last_date = ? WHERE user_id = ?', (today, user_id))
             conn.commit()
-        return count, DAILY_LIMIT + extra
     else:
-        c.execute('INSERT INTO users VALUES (?,0,?,0)', (user_id, today))
+        cursor.execute('INSERT INTO users (user_id, daily_count, last_date, extra_tasks) VALUES (?, 0, ?, 0)', (user_id, today))
         conn.commit()
-        return 0, DAILY_LIMIT
+    limit = DAILY_LIMIT + extra_tasks
+    return count, limit
 
-def inc(user_id):
-    c.execute('UPDATE users SET daily_count = daily_count + 1 WHERE user_id=?', (user_id,))
+# Функция: Увеличить счётчик
+def increment_count(user_id):
+    cursor.execute('UPDATE users SET daily_count = daily_count + 1 WHERE user_id = ?', (user_id,))
     conn.commit()
 
-def add_extra(user_id, n):
-    c.execute('UPDATE users SET extra_tasks = extra_tasks + ? WHERE user_id=?', (n, user_id))
+# Функция: Добавить extra_tasks за реферала
+def add_extra_tasks(user_id, amount):
+    cursor.execute('UPDATE users SET extra_tasks = extra_tasks + ? WHERE user_id = ?', (amount, user_id))
     conn.commit()
 
-def save_history(user_id, eq, sol):
-    ts = datetime.now().strftime('%Y-%m-%d %H:%M')
-    c.execute('INSERT INTO history (user_id, ts, eq, sol) VALUES (?,?,?,?)', (user_id, ts, eq, sol))
+# Функция: Добавить в историю
+def add_to_history(user_id, equation, solution):
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    cursor.execute('INSERT INTO history (user_id, timestamp, equation, solution) VALUES (?, ?, ?, ?)', (user_id, timestamp, equation, solution))
     conn.commit()
 
-def solve(txt):
+# Функция: Получить историю
+def get_history(user_id):
+    cursor.execute('SELECT timestamp, equation, solution FROM history WHERE user_id = ? ORDER BY id DESC LIMIT 10', (user_id,))
+    return cursor.fetchall()
+
+# Функция: Реферальная система
+async def referral(update: Update, context):
+    user_id = update.message.from_user.id
+    ref_link = f"https://t.me/{context.bot.username}?start=ref_{user_id}"
+    await update.message.reply_text(
+        f"Пригласи друга — получи +{REFERRAL_REWARD} задачу в день!\n\n"
+        f"Твоя ссылка: {ref_link}\n\n"
+        f"Друг перейдёт — твой лимит навсегда +{REFERRAL_REWARD} задач/день."
+    )
+
+# Функция: Решить уравнение + пошагово
+def solve_equation(equation_text):
     try:
-        txt = re.sub(r'\s+', '', txt.lower())
-        txt = txt.replace('х', 'x')
-        txt = re.sub(r'([a-z])(\d)', r'\1**\2', txt)
-        txt = re.sub(r'[^0-9a-z+\-*/()=.\^]', '', txt)
-        if '=' not in txt: return "Нет '='", None
-        l, r = txt.split('=', 1)
+        # Очистка (как раньше)
+        text = re.sub(r'\s+', '', equation_text)
+        text = text.lower().replace('х', 'x').replace('ь', '').replace("'", '').replace('"', '').replace('`', '').replace('’', '').replace('‘', '')
+        text = re.sub(r'([a-z])(\d)', r'\1**\2', text)
+        text = re.sub(r'[^0-9a-z+\-*/()=.\^]', '', text)
+
+        if '=' not in text:
+            return "Ошибка: Нет '='. Пример: '2x+5=13'", None
+        
+        left, right = text.split('=', 1)
+        left = left.strip()
+        right = right.strip()
+        
+        if not left or not right:
+            return "Ошибка: Пустая сторона.", None
+        
         x = symbols('x')
-        trans = standard_transformations + (implicit_multiplication_application, convert_xor,)
-        le, re = parse_expr(l, transformations=trans), parse_expr(r, transformations=trans)
-        eq = Eq(le, re)
-        sol = solve(eq, x)
-        diff = (le - re).simplify()
-        steps = [f"Уравнение: {txt}", f"Лево: {le} = Право: {re}", f"→ {diff} = 0"]
-        poly = Poly(diff, x)
-        if poly and poly.degree() == 1:
-            a, b = poly.all_coeffs()
-            steps += [f"{a}x = {-b}", f"x = {-b/a}", f"x = {sol[0]}"]
+        transformations = standard_transformations + (implicit_multiplication_application, convert_xor,)
+        
+        left_expr = parse_expr(left, transformations=transformations)
+        right_expr = parse_expr(right, transformations=transformations)
+        
+        eq = Eq(left_expr, right_expr)
+        solution = sym_solve(eq, x)
+        
+        # Шаги (как раньше)
+        steps = []
+        steps.append(f"Уравнение: {equation_text}")
+        steps.append(f"Очищенное: {left} = {right}")
+        
+        diff_expr = simplify(left_expr - right_expr)
+        steps.append(f"Влево: {diff_expr} = 0")
+        
+        poly = Poly(diff_expr, x)
+        if poly is not None:
+            degree = poly.degree()
+            coeffs = poly.all_coeffs()
+            if degree == 1:
+                a = coeffs[0]
+                b = coeffs[1] if len(coeffs) > 1 else 0
+                steps.append(f"{a}x = {-b}")
+                steps.append(f"x = {-b} / {a}")
+                steps.append(f"x = {solution[0]}")
+            elif degree == 2:
+                a = coeffs[0]
+                b = coeffs[1] if len(coeffs) > 1 else 0
+                c = coeffs[2] if len(coeffs) > 2 else 0
+                steps.append(f"{a}x² + {b}x + {c} = 0")
+                disc = simplify(b**2 - 4*a*c)
+                steps.append(f"D = {disc}")
+                if disc >= 0:
+                    steps.append(f"x1 = {solution[0]}")
+                    steps.append(f"x2 = {solution[1]}")
+            else:
+                steps.append(f"x = {solution}")
         else:
-            steps.append(f"x = {sol}")
-        return '\n'.join(steps), sol
+            steps.append(f"x = {solution}")
+        
+        return '\n'.join(steps), solution
     except Exception as e:
-        return f"Ошибка: {e}", None
+        return f"Ошибка: {str(e)}. Введи вручную.", None
 
+# /start с меню и рефералами
 async def start(update: Update, context):
-    u = update.message.from_user.id
+    user_id = update.message.from_user.id
     args = context.args
+    
+    # Если по рефералке
     if args and args[0].startswith('ref_'):
-        ref = int(args[0].split('_')[1])
-        if ref != u:
-            add_extra(ref, REFERRAL_REWARD)
-            await context.bot.send_message(ref, f"Друг пришёл! +{REFERRAL_REWARD} задача навсегда! 🚀")
-    get_user(u)
-    kb = [['Решить задачу'], ['Мой уровень', 'История'], ['Пригласить друга']]
-    await update.message.reply_text('Salom! Меню:', reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+        referrer_id = int(args[0].split('_')[1])
+        if referrer_id != user_id:
+            add_extra_tasks(referrer_id, REFERRAL_REWARD)
+            await context.bot.send_message(referrer_id, f"Друг зарегистрировался! Твой лимит +{REFERRAL_REWARD} задач/день навсегда! 🚀")
+    
+    # Обычный старт
+    get_user_level(user_id)
+    keyboard = [['Решить задачу'], ['Мой уровень', 'История'], ['Пригласить друга']]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    await update.message.reply_text('Salom! Выбери в меню:', reply_markup=reply_markup)
 
-async def text(update: Update, context):
-    t = update.message.text
-    u = update.message.from_user.id
-    count, limit = get_user(u)
-    if t == 'Решить задачу':
-        await update.message.reply_text('Фото или текст уравнения!')
+# Обработчик текста (объединили кнопки и решение)
+async def handle_text(update: Update, context):
+    text = update.message.text
+    user_id = update.message.from_user.id
+    count, limit = get_user_level(user_id)
+    
+    if text == 'Решить задачу':
+        await update.message.reply_text('Пришли фото или текст уравнения (например: 2x + 5 = 13)')
         return
-    if t == 'Мой уровень':
-        await update.message.reply_text(f'Сегодня: {count}/{limit}')
+    
+    elif text == 'Мой уровень':
+        await update.message.reply_text(f'Сегодня: {count}/{limit} задач')
         return
-    if t == 'История':
-        c.execute('SELECT ts, eq, sol FROM history WHERE user_id=? ORDER BY id DESC LIMIT 5', (u,))
-        h = c.fetchall()
-        msg = 'Последние:\n' if h else 'Пусто'
-        for ts, eq, sol in h:
-            msg += f"{ts}: {eq} → {sol}\n"
-        await update.message.reply_text(msg)
+    
+    elif text == 'История':
+        history = get_history(user_id)
+        if history:
+            msg = 'Последние задачи:\n'
+            for ts, eq, sol in history:
+                msg += f"{ts}: {eq} → {sol}\n"
+            await update.message.reply_text(msg)
+        else:
+            await update.message.reply_text('История пуста.')
         return
-    if t == 'Пригласить друга':
-        link = f"https://t.me/{context.bot.username}?start=ref_{u}"
-        await update.message.reply_text(f"Твоя ссылка:\n{link}\n+{REFERRAL_REWARD} задача за друга!")
+    
+    elif text == 'Пригласить друга':
+        await referral(update, context)
         return
+    
+    else:
+        # Решение уравнения
+        if count >= limit:
+            await update.message.reply_text(f'Лимит! Пригласи друга за +{REFERRAL_REWARD} задачу в день.')
+            return
+        
+        steps, solution = solve_equation(text)
+        await update.message.reply_text(steps)
+        
+        if solution:
+            increment_count(user_id)
+            add_to_history(user_id, text, str(solution))
+
+# Фото: Распознать + решить
+async def handle_photo(update: Update, context):
+    user_id = update.message.from_user.id
+    count, limit = get_user_level(user_id)
+    
     if count >= limit:
-        await update.message.reply_text(f'Лимит! Пригласи друга → +{REFERRAL_REWARD}')
+        await update.message.reply_text(f'Лимит! Пригласи друга за +{REFERRAL_REWARD} задачу в день.')
         return
-    steps, sol = solve(t)
-    await update.message.reply_text(steps or "Не понял")
-    if sol:
-        inc(u)
-        save_history(u, t, str(sol))
+    
+    photo = await update.message.photo[-1].get_file()
+    photo_url = photo.file_path
+    response = requests.get(photo_url)
+    img = Image.open(io.BytesIO(response.content))
+    
+    result = reader.readtext(img)
+    text = ' '.join([detection[1] for detection in result])
+    
+    if text.strip():
+        await update.message.reply_text(f"Matn: {text}")
+        steps, solution = solve_equation(text)
+        await update.message.reply_text(steps)
+        if solution:
+            increment_count(user_id)
+            add_to_history(user_id, text, str(solution))
+    else:
+        await update.message.reply_text("Matn topilmadi.")
 
-async def photo(update: Update, context):
-    u = update.message.from_user.id
-    count, limit = get_user(u)
-    if count >= limit:
-        await update.message.reply_text('Лимит! Пригласи друга')
-        return
-    file = await update.message.photo[-1].get_file()
-    bytes = await file.download_as_bytearray()
-    img = Image.open(io.BytesIO(bytes))
-    txt = ' '.join([x[1] for x in reader.readtext(img)])
-    await update.message.reply_text(f"Текст: {txt}")
-    steps, sol = solve(txt)
-    await update.message.reply_text(steps)
-    if sol:
-        inc(u)
-        save_history(u, txt, str(sol))
-
+# Запуск
 app = ApplicationBuilder().token(TOKEN).build()
+
 app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text))
-app.add_handler(MessageHandler(filters.PHOTO, photo))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))  # Один хендлер для текста
+app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-# Flask — 24/7
-flask = Flask('')
-@flask.route('/')
-def home():
-    return "Bot жив! 🚀"
-def run_flask():
-    flask.run(host='0.0.0.0', port=8080)
-Thread(target=run_flask).start()
-
-print("Bot запущен!")
 app.run_polling()
