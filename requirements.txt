@@ -1,5 +1,5 @@
 python-telegram-bot==20.8
 easyocr==1.7.1
-sympy==1.12
+sympy==1.13.3
 Pillow==10.4.0
 python-dotenv==1.0.1
