@@ -1,8 +1,8 @@
 import logging
 import os
 from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, CallbackQueryHandler
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 import easyocr
 import requests
 from PIL import Image
@@ -11,8 +11,9 @@ from sympy import symbols, Eq, solve, simplify, Poly, sqrt
 from sympy.solvers import solve as sym_solve
 from sympy.parsing.sympy_parser import parse_expr, standard_transformations, implicit_multiplication_application, convert_xor
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
 import re
+from flask import Flask, request, abort
 
 # Загружаем .env
 load_dotenv()
@@ -29,6 +30,9 @@ if not TOKEN:
 
 # Логи
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# Flask app для webhook
+app = Flask(__name__)
 
 # EasyOCR reader
 reader = easyocr.Reader(['ru', 'en'], gpu=False)
@@ -48,7 +52,7 @@ try:
     cursor.execute("ALTER TABLE users ADD COLUMN extra_tasks INTEGER DEFAULT 0")
     conn.commit()
 except sqlite3.OperationalError:
-    pass  # Колонка уже существует
+    pass
 
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS history (
@@ -194,7 +198,7 @@ async def start(update: Update, context):
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text('Salom! Выбери в меню:', reply_markup=reply_markup)
 
-# Обработчик текста (объединили кнопки и решение)
+# Обработчик текста
 async def handle_text(update: Update, context):
     text = update.message.text
     user_id = update.message.from_user.id
@@ -263,11 +267,31 @@ async def handle_photo(update: Update, context):
     else:
         await update.message.reply_text("Matn topilmadi.")
 
-# Запуск
-app = ApplicationBuilder().token(TOKEN).build()
+# Telegram Application
+telegram_app = ApplicationBuilder().token(TOKEN).build()
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))  # Один хендлер для текста
-app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+telegram_app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-app.run_polling()
+# Webhook endpoint для Telegram
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_json()
+        update = Update.de_json(json_string, telegram_app.bot)
+        telegram_app.process_update(update)
+        return ''
+    else:
+        abort(403)
+
+# Главная страница сайта (маленький сайт)
+@app.route('/')
+def index():
+    return "<h1>Бот работает! /start в Telegram</h1><p>Для админов: Логи в Render Dashboard.</p>"
+
+# Запуск Flask + Telegram webhook
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    telegram_app.bot.set_webhook(url=f'https://{os.getenv("RENDER_EXTERNAL_HOSTNAME")}/webhook')
+    app.run(host='0.0.0.0', port=port, debug=False)
