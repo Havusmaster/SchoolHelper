@@ -4,7 +4,7 @@ import io
 import requests
 from datetime import datetime
 from PIL import Image
-import easyocr
+# EasyOCR импортируем лениво внутри функции, чтобы экономить память
 import sqlite3
 
 # Импорт модулей решения задач
@@ -35,8 +35,21 @@ if not TOKEN:
 # Логи
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# EasyOCR reader
-reader = easyocr.Reader(['ru', 'en'], gpu=False)
+# Настройки OCR из окружения (для экономии памяти на Render можно выключить)
+OCR_ENABLED = os.getenv('OCR_ENABLED', '0') in ('1', 'true', 'True')
+OCR_LANGS = os.getenv('OCR_LANGS', 'en')  # по умолчанию только 'en' для меньшей памяти
+
+_ocr_reader = None
+
+def get_ocr_reader():
+    global _ocr_reader
+    if _ocr_reader is not None:
+        return _ocr_reader
+    # Ленивая загрузка только при первом обращении
+    import easyocr  # импорт здесь, чтобы не грузить модуль при старте
+    langs = [lang.strip() for lang in OCR_LANGS.split(',') if lang.strip()]
+    _ocr_reader = easyocr.Reader(langs, gpu=False)
+    return _ocr_reader
 
 # База данных SQLite
 conn = sqlite3.connect('users.db')
@@ -486,13 +499,22 @@ async def handle_photo(update: Update, context):
         await safe_reply_text(update, f'Лимит! Пригласи друга за +{REFERRAL_REWARD} задачу в день.')
         return
     
+    if not OCR_ENABLED:
+        await safe_reply_text(update, 'OCR отключен для экономии памяти. Пришли текст уравнения, пожалуйста.')
+        return
     photo = await update.message.photo[-1].get_file()
     photo_url = photo.file_path
     response = requests.get(photo_url)
     img = Image.open(io.BytesIO(response.content))
     
-    result = reader.readtext(img)
-    text = ' '.join([detection[1] for detection in result])
+    try:
+        reader = get_ocr_reader()
+        result = reader.readtext(img)
+        text = ' '.join([detection[1] for detection in result])
+    except Exception as e:
+        logging.error(f"OCR error: {e}")
+        await safe_reply_text(update, 'Не получилось распознать фото. Пришли текст уравнения, пожалуйста.')
+        return
     
     if text.strip():
         await safe_reply_text(update, f"Matn: {text}")
