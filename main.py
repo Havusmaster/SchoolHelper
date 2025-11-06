@@ -7,11 +7,15 @@ from PIL import Image
 # EasyOCR импортируем лениво внутри функции, чтобы экономить память
 import sqlite3
 
+from flask import Flask
+import threading
+
 # Импорт модулей решения задач
 from algebra import solve_equation
 
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, Poll
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, CallbackQueryHandler
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, CallbackQueryHandler, PollHandler, PollAnswerHandler
+import json
 from telegram.error import TimedOut, NetworkError, RetryAfter
 import asyncio
 
@@ -105,6 +109,29 @@ CREATE TABLE IF NOT EXISTS support_messages (
 ''')
 conn.commit()
 
+# Таблицы для опросов
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS polls (
+    poll_id TEXT PRIMARY KEY,
+    question TEXT,
+    options_json TEXT,
+    total_voter_count INTEGER DEFAULT 0,
+    is_closed INTEGER DEFAULT 0,
+    last_update TEXT
+)
+''')
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS poll_answers (
+    poll_id TEXT,
+    user_id INTEGER,
+    option_ids TEXT,
+    username TEXT,
+    first_name TEXT,
+    PRIMARY KEY (poll_id, user_id)
+)
+''')
+conn.commit()
+
 # Основная клавиатура
 def main_keyboard(is_admin: bool):
     keyboard = [['Решить задачу'], ['Мой уровень', 'История'], ['Пригласить друга'], ['Поддержка']]
@@ -116,6 +143,7 @@ def main_keyboard(is_admin: bool):
 def admin_keyboard():
     keyboard = [
         ['Статистика', 'Пользователи'],
+        ['Опросы'],
         ['Все сообщения'],
         ['Назад']
     ]
@@ -285,6 +313,32 @@ async def stats(update: Update, context):
         f'Задач решено сегодня: {used}\n'
         f'Всего extra_tasks: {extra}'
     )
+
+# Обработчик обновлений опросов (агрегированное состояние опроса)
+async def on_poll(update: Update, context):
+    poll = update.poll
+    if not poll:
+        return
+    options = [{'text': opt.text, 'voter_count': opt.voter_count} for opt in poll.options]
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    cursor.execute(
+        'INSERT OR REPLACE INTO polls (poll_id, question, options_json, total_voter_count, is_closed, last_update) VALUES (?, ?, ?, ?, ?, ?)',
+        (poll.id, poll.question, json.dumps(options, ensure_ascii=False), poll.total_voter_count, int(poll.is_closed), now)
+    )
+    conn.commit()
+
+# Обработчик ответов пользователей в опросах
+async def on_poll_answer(update: Update, context):
+    ans = update.poll_answer
+    if not ans:
+        return
+    user = ans.user
+    option_ids = json.dumps(ans.option_ids)
+    cursor.execute(
+        'INSERT OR REPLACE INTO poll_answers (poll_id, user_id, option_ids, username, first_name) VALUES (?, ?, ?, ?, ?)',
+        (ans.poll_id, user.id if user else None, option_ids, getattr(user, 'username', None), getattr(user, 'first_name', None))
+    )
+    conn.commit()
 
 # Показ следующего сообщения поддержки администратору
 async def send_next_support_message(update: Update, context, after_id: int | None):
@@ -457,6 +511,28 @@ async def handle_text(update: Update, context):
             lines.append(f"{uid} — {uname_disp} — {fname_disp} — extra:{extra}")
         await update.message.reply_text('\n'.join(lines), reply_markup=admin_keyboard())
         return
+    elif text == 'Опросы' and user_id == ADMIN_ID:
+        # Показ последних 3 опросов с суммарными результатами
+        cursor.execute('SELECT poll_id, question, options_json, total_voter_count, is_closed, last_update FROM polls ORDER BY last_update DESC LIMIT 3')
+        polls = cursor.fetchall()
+        if not polls:
+            await update.message.reply_text('Опросов пока нет.', reply_markup=admin_keyboard())
+            return
+        blocks = []
+        for poll_id, question, options_json, total, is_closed, ts in polls:
+            try:
+                options = json.loads(options_json or '[]')
+            except:
+                options = []
+            lines = [f'Вопрос: {question}', f'Итоги (всего: {total}, статус: {"закрыт" if is_closed else "открыт"})']
+            for opt in options:
+                lines.append(f"- {opt.get('text', '')}: {opt.get('voter_count', 0)}")
+            lines.append(f"poll_id: {poll_id}")
+            if ts:
+                lines.append(f"обновлено: {ts}")
+            blocks.append('\n'.join(lines))
+        await update.message.reply_text('\n\n'.join(blocks), reply_markup=admin_keyboard())
+        return
     elif text == 'Все сообщения' and user_id == ADMIN_ID:
         await send_next_support_message(update, context, after_id=None)
         return
@@ -534,10 +610,37 @@ app.add_handler(CommandHandler("stats", stats))
 app.add_handler(CommandHandler("set_limit", set_limit))
 app.add_handler(CommandHandler("users", list_users))
 app.add_handler(CallbackQueryHandler(admin_callbacks))
+app.add_handler(PollHandler(on_poll))
+app.add_handler(PollAnswerHandler(on_poll_answer))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))  # Один хендлер для текста
 app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
 # Добавляем глобальный обработчик ошибок
 app.add_error_handler(error_handler)
 
-app.run_polling()
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def home():
+    return """
+    <h1>🧮 MathBot работает!</h1>
+    <p>Бот решает уравнения в Telegram</p>
+    <hr>
+    <pre>
+Пользователей: <b>много</b>
+Задач сегодня: <b>тысячи</b>
+Статус: <span style="color:green">ONLINE ✅</span>
+    </pre>
+    <footer>© 2025 | Deploy на Render</footer>
+    """
+
+def run_flask():
+    flask_app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
+
+if __name__ == '__main__':
+    # Запускаем Flask в отдельном потоке
+    threading.Thread(target=run_flask, daemon=True).start()
+    
+    # Запускаем Telegram-бота
+    print("🚀 Бот и сайт запущены!")
+    app.run_polling()
