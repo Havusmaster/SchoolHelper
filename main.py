@@ -1,20 +1,22 @@
 import logging
 import os
-from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, CallbackQueryHandler
-import easyocr
-import requests
-from PIL import Image
 import io
-from sympy import symbols, Eq, solve, simplify, Poly, sqrt
-from sympy.solvers import solve as sym_solve
-from sympy.parsing.sympy_parser import parse_expr, standard_transformations, implicit_multiplication_application, convert_xor
+import requests
+from datetime import datetime
+from PIL import Image
+import easyocr
 import sqlite3
-from datetime import datetime, timedelta
-import re
+
+# Импорт модулей решения задач
+from algebra import solve_equation
+
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, Poll
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, CallbackQueryHandler
+from telegram.error import TimedOut, NetworkError, RetryAfter
+import asyncio
 
 # Загружаем .env
+from dotenv import load_dotenv
 load_dotenv()
 
 # TOKEN
@@ -23,6 +25,9 @@ TOKEN = os.getenv('TOKEN')
 # Конфиг из .env
 DAILY_LIMIT = int(os.getenv('DAILY_LIMIT', 3))
 REFERRAL_REWARD = int(os.getenv('REFERRAL_REWARD', 1))
+
+# Админ ID (замени на свой user_id)
+ADMIN_ID = int(os.getenv('ADMIN_ID'))  # Укажи здесь свой Telegram user_id для админа
 
 if not TOKEN:
     raise ValueError("TOKEN не найден в .env!")
@@ -50,6 +55,18 @@ try:
 except sqlite3.OperationalError:
     pass  # Колонка уже существует
 
+# Доп. колонки профиля пользователя
+try:
+    cursor.execute("ALTER TABLE users ADD COLUMN username TEXT")
+    conn.commit()
+except sqlite3.OperationalError:
+    pass
+try:
+    cursor.execute("ALTER TABLE users ADD COLUMN first_name TEXT")
+    conn.commit()
+except sqlite3.OperationalError:
+    pass
+
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,6 +77,36 @@ CREATE TABLE IF NOT EXISTS history (
 )
 ''')
 conn.commit()
+
+# Таблица для сообщений поддержки
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS support_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    username TEXT,
+    first_name TEXT,
+    text TEXT,
+    timestamp TEXT,
+    processed INTEGER DEFAULT 0
+)
+''')
+conn.commit()
+
+# Основная клавиатура
+def main_keyboard(is_admin: bool):
+    keyboard = [['Решить задачу'], ['Мой уровень', 'История'], ['Пригласить друга'], ['Поддержка']]
+    if is_admin:
+        keyboard.append(['Админ панель'])
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+# Клавиатура админа
+def admin_keyboard():
+    keyboard = [
+        ['Статистика', 'Пользователи'],
+        ['Все сообщения'],
+        ['Назад']
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 # Функция: Получить/обновить пользователя
 def get_user_level(user_id):
@@ -80,12 +127,29 @@ def get_user_level(user_id):
     limit = DAILY_LIMIT + extra_tasks
     return count, limit
 
+# Обновить имя/юзернейм пользователя в базе
+def upsert_user_profile(user_id: int, username: str | None, first_name: str | None):
+    cursor.execute('SELECT 1 FROM users WHERE user_id = ?', (user_id,))
+    exists = cursor.fetchone() is not None
+    if exists:
+        cursor.execute(
+            'UPDATE users SET username = ?, first_name = ? WHERE user_id = ?',
+            (username, first_name, user_id)
+        )
+    else:
+        today = datetime.now().strftime('%Y-%m-%d')
+        cursor.execute(
+            'INSERT INTO users (user_id, daily_count, last_date, extra_tasks, username, first_name) VALUES (?, 0, ?, 0, ?, ?)',
+            (user_id, today, username, first_name)
+        )
+    conn.commit()
+
 # Функция: Увеличить счётчик
 def increment_count(user_id):
     cursor.execute('UPDATE users SET daily_count = daily_count + 1 WHERE user_id = ?', (user_id,))
     conn.commit()
 
-# Функция: Добавить extra_tasks за реферала
+# Функция: Добавить extra_tasks за реферала или админа
 def add_extra_tasks(user_id, amount):
     cursor.execute('UPDATE users SET extra_tasks = extra_tasks + ? WHERE user_id = ?', (amount, user_id))
     conn.commit()
@@ -101,6 +165,63 @@ def get_history(user_id):
     cursor.execute('SELECT timestamp, equation, solution FROM history WHERE user_id = ? ORDER BY id DESC LIMIT 10', (user_id,))
     return cursor.fetchall()
 
+# Функция: Безопасная отправка сообщения с повторными попытками
+async def safe_reply_text(update: Update, text: str, parse_mode=None, reply_markup=None, max_retries=3):
+    """Отправляет сообщение с обработкой ошибок и повторными попытками"""
+    for attempt in range(max_retries):
+        try:
+            if parse_mode:
+                await update.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+            else:
+                await update.message.reply_text(text, reply_markup=reply_markup)
+            return True
+        except TimedOut:
+            logging.warning(f"TimedOut при отправке сообщения (попытка {attempt + 1}/{max_retries})")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2)  # Ждём 2 секунды перед повторной попыткой
+            else:
+                logging.error("Не удалось отправить сообщение после всех попыток")
+                try:
+                    await update.message.reply_text("⏱️ Время ожидания истекло. Попробуй ещё раз.")
+                except:
+                    pass
+                return False
+        except RetryAfter as e:
+            logging.warning(f"RetryAfter: нужно подождать {e.retry_after} секунд")
+            await asyncio.sleep(e.retry_after + 1)
+        except NetworkError as e:
+            logging.warning(f"NetworkError при отправке сообщения (попытка {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2)
+            else:
+                logging.error("Не удалось отправить сообщение из-за сетевой ошибки")
+                return False
+        except Exception as e:
+            logging.error(f"Неожиданная ошибка при отправке сообщения: {e}")
+            return False
+    return False
+
+# Глобальный обработчик ошибок
+async def error_handler(update: object, context):
+    """Обрабатывает ошибки, возникающие в хендлерах"""
+    from telegram.ext import ContextTypes
+    
+    if isinstance(context, ContextTypes.DEFAULT_TYPE):
+        error = context.error
+    else:
+        error = context
+    
+    logging.error(f"Ошибка при обработке обновления: {error}")
+    
+    if isinstance(error, TimedOut):
+        logging.warning("Ошибка таймаута обработана - бот продолжит работу")
+    elif isinstance(error, NetworkError):
+        logging.warning(f"Ошибка сети: {error} - бот продолжит работу")
+    elif isinstance(error, RetryAfter):
+        logging.warning(f"Нужно подождать: {error.retry_after} секунд")
+    else:
+        logging.error(f"Необработанная ошибка: {error}")
+
 # Функция: Реферальная система
 async def referral(update: Update, context):
     user_id = update.message.from_user.id
@@ -111,74 +232,11 @@ async def referral(update: Update, context):
         f"Друг перейдёт — твой лимит навсегда +{REFERRAL_REWARD} задач/день."
     )
 
-# Функция: Решить уравнение + пошагово
-def solve_equation(equation_text):
-    try:
-        # Очистка (как раньше)
-        text = re.sub(r'\s+', '', equation_text)
-        text = text.lower().replace('х', 'x').replace('ь', '').replace("'", '').replace('"', '').replace('`', '').replace('’', '').replace('‘', '')
-        text = re.sub(r'([a-z])(\d)', r'\1**\2', text)
-        text = re.sub(r'[^0-9a-z+\-*/()=.\^]', '', text)
-
-        if '=' not in text:
-            return "Ошибка: Нет '='. Пример: '2x+5=13'", None
-        
-        left, right = text.split('=', 1)
-        left = left.strip()
-        right = right.strip()
-        
-        if not left or not right:
-            return "Ошибка: Пустая сторона.", None
-        
-        x = symbols('x')
-        transformations = standard_transformations + (implicit_multiplication_application, convert_xor,)
-        
-        left_expr = parse_expr(left, transformations=transformations)
-        right_expr = parse_expr(right, transformations=transformations)
-        
-        eq = Eq(left_expr, right_expr)
-        solution = sym_solve(eq, x)
-        
-        # Шаги (как раньше)
-        steps = []
-        steps.append(f"Уравнение: {equation_text}")
-        steps.append(f"Очищенное: {left} = {right}")
-        
-        diff_expr = simplify(left_expr - right_expr)
-        steps.append(f"Влево: {diff_expr} = 0")
-        
-        poly = Poly(diff_expr, x)
-        if poly is not None:
-            degree = poly.degree()
-            coeffs = poly.all_coeffs()
-            if degree == 1:
-                a = coeffs[0]
-                b = coeffs[1] if len(coeffs) > 1 else 0
-                steps.append(f"{a}x = {-b}")
-                steps.append(f"x = {-b} / {a}")
-                steps.append(f"x = {solution[0]}")
-            elif degree == 2:
-                a = coeffs[0]
-                b = coeffs[1] if len(coeffs) > 1 else 0
-                c = coeffs[2] if len(coeffs) > 2 else 0
-                steps.append(f"{a}x² + {b}x + {c} = 0")
-                disc = simplify(b**2 - 4*a*c)
-                steps.append(f"D = {disc}")
-                if disc >= 0:
-                    steps.append(f"x1 = {solution[0]}")
-                    steps.append(f"x2 = {solution[1]}")
-            else:
-                steps.append(f"x = {solution}")
-        else:
-            steps.append(f"x = {solution}")
-        
-        return '\n'.join(steps), solution
-    except Exception as e:
-        return f"Ошибка: {str(e)}. Введи вручную.", None
-
-# /start с меню и рефералами
+# /start с меню, рефералами и опросом
 async def start(update: Update, context):
-    user_id = update.message.from_user.id
+    user = update.message.from_user
+    user_id = user.id
+    upsert_user_profile(user_id, user.username, user.first_name)
     args = context.args
     
     # Если по рефералке
@@ -190,14 +248,147 @@ async def start(update: Update, context):
     
     # Обычный старт
     get_user_level(user_id)
-    keyboard = [['Решить задачу'], ['Мой уровень', 'История'], ['Пригласить друга']]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    reply_markup = main_keyboard(user_id == ADMIN_ID)
     await update.message.reply_text('Salom! Выбери в меню:', reply_markup=reply_markup)
+    
+    # Опрос при старте
+    await update.message.reply_poll(
+        question="Какой новый предмет добавить?",
+        options=["Kimyo (Химия)", "Geometriya (Геометрия)"],
+        is_anonymous=False,
+        allows_multiple_answers=False
+    )
+
+# Команда: /stats (только админ)
+async def stats(update: Update, context):
+    user_id = update.message.from_user.id
+    if user_id != ADMIN_ID:
+        return
+    cursor.execute('SELECT COUNT(*), SUM(daily_count), SUM(extra_tasks) FROM users')
+    row = cursor.fetchone()
+    total, used, extra = (row if row is not None else (0, 0, 0))
+    await update.message.reply_text(
+        f'Пользователей: {total}\n'
+        f'Задач решено сегодня: {used}\n'
+        f'Всего extra_tasks: {extra}'
+    )
+
+# Показ следующего сообщения поддержки администратору
+async def send_next_support_message(update: Update, context, after_id: int | None):
+    if after_id is None:
+        cursor.execute('SELECT id, user_id, username, first_name, text, timestamp FROM support_messages WHERE processed = 0 ORDER BY id ASC LIMIT 1')
+    else:
+        cursor.execute('SELECT id, user_id, username, first_name, text, timestamp FROM support_messages WHERE processed = 0 AND id > ? ORDER BY id ASC LIMIT 1', (after_id,))
+    row = cursor.fetchone()
+    if not row:
+        await update.message.reply_text('Нет новых сообщений.', reply_markup=admin_keyboard())
+        return
+    msg_id, uid, uname, fname, text, ts = row
+    uname_disp = f"@{uname}" if uname else '(нет username)'
+    header = f"ID:{msg_id} | {ts}\nОт: {uid} {uname_disp} {fname or ''}\n\n{text}"
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton('Обработано ✅', callback_data=f'support_done:{msg_id}'),
+            InlineKeyboardButton('Следующее ▶️', callback_data=f'support_next:{msg_id}')
+        ]
+    ])
+    await update.message.reply_text(header, reply_markup=kb)
+
+# Обработчик inline-кнопок админа
+async def admin_callbacks(update: Update, context):
+    query = update.callback_query
+    data = query.data or ''
+    await query.answer()
+    if not data or update.effective_user.id != ADMIN_ID:
+        return
+    if data.startswith('support_done:'):
+        _, sid = data.split(':', 1)
+        try:
+            sid_i = int(sid)
+        except ValueError:
+            return
+        cursor.execute('UPDATE support_messages SET processed = 1 WHERE id = ?', (sid_i,))
+        conn.commit()
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text('Отмечено как обработано.', reply_markup=admin_keyboard())
+    elif data.startswith('support_next:'):
+        _, sid = data.split(':', 1)
+        try:
+            sid_i = int(sid)
+        except ValueError:
+            return
+        # Отправим следующее сообщение
+        dummy_update = Update(update.update_id, message=query.message)
+        await send_next_support_message(dummy_update, context, after_id=sid_i)
+
+# Команда: /set_limit <user_id> <кол-во> (только админ)
+async def set_limit(update: Update, context):
+    user_id = update.message.from_user.id
+    if user_id != ADMIN_ID:
+        return
+    args = context.args
+    if len(args) != 2:
+        await update.message.reply_text('Формат: /set_limit <user|@username|id> <кол-во>')
+        return
+    try:
+        ref = args[0]
+        # Разрешить id или @username
+        target: int | None = None
+        if ref.startswith('@'):
+            uname = ref[1:]
+            cursor.execute('SELECT user_id FROM users WHERE LOWER(username) = LOWER(?)', (uname,))
+            row = cursor.fetchone()
+            if row:
+                target = int(row[0])
+        else:
+            try:
+                target = int(ref)
+            except ValueError:
+                # Попробуем как username без @
+                cursor.execute('SELECT user_id FROM users WHERE LOWER(username) = LOWER(?)', (ref,))
+                row = cursor.fetchone()
+                if row:
+                    target = int(row[0])
+        if target is None:
+            await update.message.reply_text('Пользователь не найден. Используй /users <поиск> чтобы найти.')
+            return
+        amount = int(args[1])
+        add_extra_tasks(target, amount)
+        await update.message.reply_text(f'Пользователю {target} добавлено {amount} extra_tasks')
+    except ValueError:
+        await update.message.reply_text('Неверный формат. Пример: /set_limit @username 5')
+
+# Команда: /users [filter]
+async def list_users(update: Update, context):
+    user_id = update.message.from_user.id
+    if user_id != ADMIN_ID:
+        return
+    q = ' '.join(context.args) if context.args else ''
+    if q:
+        like = f"%{q.lower()}%"
+        cursor.execute(
+            'SELECT user_id, username, first_name, extra_tasks FROM users WHERE LOWER(COALESCE(username, "")) LIKE ? OR LOWER(COALESCE(first_name, "")) LIKE ? ORDER BY user_id DESC LIMIT 20',
+            (like, like)
+        )
+    else:
+        cursor.execute('SELECT user_id, username, first_name, extra_tasks FROM users ORDER BY user_id DESC LIMIT 20')
+    rows = cursor.fetchall()
+    if not rows:
+        await update.message.reply_text('Пользователи не найдены.')
+        return
+    lines = ['Последние пользователи:']
+    for uid, uname, fname, extra in rows:
+        uname_disp = f"@{uname}" if uname else '(нет username)'
+        fname_disp = fname or ''
+        lines.append(f"{uid} — {uname_disp} — {fname_disp} — extra:{extra}")
+    await update.message.reply_text('\n'.join(lines))
 
 # Обработчик текста (объединили кнопки и решение)
 async def handle_text(update: Update, context):
     text = update.message.text
-    user_id = update.message.from_user.id
+    user = update.message.from_user
+    user_id = user.id
+    upsert_user_profile(user_id, user.username, user.first_name)
     count, limit = get_user_level(user_id)
     
     if text == 'Решить задачу':
@@ -223,14 +414,62 @@ async def handle_text(update: Update, context):
         await referral(update, context)
         return
     
+    elif text == 'Админ панель' and user_id == ADMIN_ID:
+        await update.message.reply_text('Админ панель: выбери действие.', reply_markup=admin_keyboard())
+        return
+    elif text == 'Назад' and user_id == ADMIN_ID:
+        await update.message.reply_text('Назад в меню.', reply_markup=main_keyboard(True))
+        return
+    elif text == 'Статистика' and user_id == ADMIN_ID:
+        cursor.execute('SELECT COUNT(*), SUM(daily_count), SUM(extra_tasks) FROM users')
+        row = cursor.fetchone()
+        total, used, extra = (row if row is not None else (0, 0, 0))
+        await update.message.reply_text(
+            f'Пользователей: {total}\n'
+            f'Задач решено сегодня: {used}\n'
+            f'Всего extra_tasks: {extra}',
+            reply_markup=admin_keyboard()
+        )
+        return
+    elif text == 'Пользователи' and user_id == ADMIN_ID:
+        cursor.execute('SELECT user_id, username, first_name, extra_tasks FROM users ORDER BY user_id DESC LIMIT 20')
+        rows = cursor.fetchall()
+        if not rows:
+            await update.message.reply_text('Пользователи не найдены.', reply_markup=admin_keyboard())
+            return
+        lines = ['Последние пользователи:']
+        for uid, uname, fname, extra in rows:
+            uname_disp = f"@{uname}" if uname else '(нет username)'
+            fname_disp = fname or ''
+            lines.append(f"{uid} — {uname_disp} — {fname_disp} — extra:{extra}")
+        await update.message.reply_text('\n'.join(lines), reply_markup=admin_keyboard())
+        return
+    elif text == 'Все сообщения' and user_id == ADMIN_ID:
+        await send_next_support_message(update, context, after_id=None)
+        return
+    
+    elif context.user_data.get('support_mode'):
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        cursor.execute(
+            'INSERT INTO support_messages (user_id, username, first_name, text, timestamp, processed) VALUES (?, ?, ?, ?, ?, 0)',
+            (user_id, user.username, user.first_name, text, timestamp)
+        )
+        conn.commit()
+        context.user_data['support_mode'] = False
+        await update.message.reply_text('Сообщение отправлено администратору. Спасибо!', reply_markup=main_keyboard(user_id == ADMIN_ID))
+        return
+    elif text == 'Поддержка':
+        context.user_data['support_mode'] = True
+        await update.message.reply_text('Напиши своё сообщение. Я передам администратору.', reply_markup=main_keyboard(user_id == ADMIN_ID))
+        return
     else:
         # Решение уравнения
         if count >= limit:
-            await update.message.reply_text(f'Лимит! Пригласи друга за +{REFERRAL_REWARD} задачу в день.')
+            await safe_reply_text(update, f'Лимит! Пригласи друга за +{REFERRAL_REWARD} задачу в день.')
             return
         
         steps, solution = solve_equation(text)
-        await update.message.reply_text(steps)
+        await safe_reply_text(update, steps, parse_mode='HTML')
         
         if solution:
             increment_count(user_id)
@@ -238,11 +477,13 @@ async def handle_text(update: Update, context):
 
 # Фото: Распознать + решить
 async def handle_photo(update: Update, context):
-    user_id = update.message.from_user.id
+    user = update.message.from_user
+    user_id = user.id
+    upsert_user_profile(user_id, user.username, user.first_name)
     count, limit = get_user_level(user_id)
     
     if count >= limit:
-        await update.message.reply_text(f'Лимит! Пригласи друга за +{REFERRAL_REWARD} задачу в день.')
+        await safe_reply_text(update, f'Лимит! Пригласи друга за +{REFERRAL_REWARD} задачу в день.')
         return
     
     photo = await update.message.photo[-1].get_file()
@@ -254,20 +495,27 @@ async def handle_photo(update: Update, context):
     text = ' '.join([detection[1] for detection in result])
     
     if text.strip():
-        await update.message.reply_text(f"Matn: {text}")
+        await safe_reply_text(update, f"Matn: {text}")
         steps, solution = solve_equation(text)
-        await update.message.reply_text(steps)
+        await safe_reply_text(update, steps, parse_mode='HTML')
         if solution:
             increment_count(user_id)
             add_to_history(user_id, text, str(solution))
     else:
-        await update.message.reply_text("Matn topilmadi.")
+        await safe_reply_text(update, "Matn topilmadi.")
 
 # Запуск
 app = ApplicationBuilder().token(TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("stats", stats))
+app.add_handler(CommandHandler("set_limit", set_limit))
+app.add_handler(CommandHandler("users", list_users))
+app.add_handler(CallbackQueryHandler(admin_callbacks))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))  # Один хендлер для текста
 app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+
+# Добавляем глобальный обработчик ошибок
+app.add_error_handler(error_handler)
 
 app.run_polling()
