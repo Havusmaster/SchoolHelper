@@ -13,8 +13,8 @@ import threading
 # Импорт модулей решения задач
 from algebra import solve_equation
 
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, Poll
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, CallbackQueryHandler, PollHandler, PollAnswerHandler
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import json
 from telegram.error import TimedOut, NetworkError, RetryAfter
 import asyncio
@@ -627,9 +627,9 @@ def home():
     <p>Бот решает уравнения в Telegram</p>
     <hr>
     <pre>
-Пользователей: <b>много</b>
-Задач сегодня: <b>тысячи</b>
-Статус: <span style="color:green">ONLINE ✅</span>
+        Пользователей: <b>много</b>
+        Задач сегодня: <b>тысячи</b>
+        Статус: <span style="color:green">ONLINE ✅</span>
     </pre>
     <footer>© 2025 | Deploy на Render</footer>
     """
@@ -638,9 +638,14 @@ def run_flask():
     flask_app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
 
 if __name__ == '__main__':
-    # Запускаем Flask в отдельном потоке
     threading.Thread(target=run_flask, daemon=True).start()
+    print("Бот и сайт запущены!")
     
-    # Запускаем Telegram-бота
-    print("🚀 Бот и сайт запущены!")
-    app.run_polling()
+    # Новый способ запуска в v21+
+    application = Application.builder().token(TOKEN).build()
+    
+    # Добавь хендлеры (пример)
+    application.add_handler(CommandHandler("start", start))
+    # ... остальные хендлеры
+
+    application.run_polling()
