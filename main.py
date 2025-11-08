@@ -1,7 +1,10 @@
 import logging
 import os
+import io
+import requests
 from datetime import datetime
-# Убраны ненужные импорты: io, requests, PIL.Image
+from PIL import Image
+# EasyOCR импортируем лениво внутри функции, чтобы экономить память
 import sqlite3
 
 # Импорт модулей решения задач
@@ -40,6 +43,22 @@ if not TOKEN:
 
 # Логи
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# Настройки OCR из окружения (для экономии памяти на Render можно выключить)
+OCR_ENABLED = os.getenv('OCR_ENABLED', '1') in ('1', 'true', 'True')
+OCR_LANGS = os.getenv('OCR_LANGS', 'en')  # по умолчанию только 'en' для меньшей памяти
+
+_ocr_reader = None
+
+def get_ocr_reader():
+    global _ocr_reader
+    if _ocr_reader is not None:
+        return _ocr_reader
+    # Ленивая загрузка только при первом обращении
+    import easyocr  # импорт здесь, чтобы не грузить модуль при старте
+    langs = [lang.strip() for lang in OCR_LANGS.split(',') if lang.strip()]
+    _ocr_reader = easyocr.Reader(langs, gpu=False)
+    return _ocr_reader
 
 # База данных SQLite
 conn = sqlite3.connect('users.db')
@@ -513,9 +532,43 @@ async def handle_text(update: Update, context):
         # Нет автоматического решения
         await safe_reply_text(update, 'Выбери урок, чтобы увидеть объяснение и решить задачу.')
 
-# Фото: Распознать + решить (упрощено без OCR для MVP)
+# Фото: Распознать + решить (оставили как алгебру по умолчанию, но можно изменить)
 async def handle_photo(update: Update, context):
-    await safe_reply_text(update, 'Фото-распознавание отключено в MVP. Пришли текст уравнения, пожалуйста.')
+    user = update.message.from_user
+    user_id = user.id
+    upsert_user_profile(user_id, user.username, user.first_name)
+    count, limit = get_user_level(user_id)
+    
+    if count >= limit:
+        await safe_reply_text(update, f'Лимит! Пригласи друга за +{REFERRAL_REWARD} задачу в день.')
+        return
+    
+    if not OCR_ENABLED:
+        await safe_reply_text(update, 'OCR отключен для экономии памяти. Пришли текст уравнения, пожалуйста.')
+        return
+    photo = await update.message.photo[-1].get_file()
+    photo_url = photo.file_path
+    response = requests.get(photo_url)
+    img = Image.open(io.BytesIO(response.content))
+    
+    try:
+        reader = get_ocr_reader()
+        result = reader.readtext(img)
+        text = ' '.join([detection[1] for detection in result])
+    except Exception as e:
+        logging.error(f"OCR error: {e}")
+        await safe_reply_text(update, 'Не получилось распознать фото. Пришли текст уравнения, пожалуйста.')
+        return
+    
+    if text.strip():
+        await safe_reply_text(update, f"Текст: {text}")
+        steps, solution = solve_equation(text)
+        await safe_reply_text(update, steps, parse_mode='HTML')
+        if solution:
+            increment_count(user_id)
+            add_to_history(user_id, text, str(solution))
+    else:
+        await safe_reply_text(update, "Текст не найден.")
 
 # /help
 async def help_command(update: Update, context):
@@ -525,7 +578,7 @@ async def help_command(update: Update, context):
         "✅ Алгебра: уравнения 5–11 класс\n"
         "✅ Геометрия: площадь, периметр, Пифагор\n"
         "✅ Физика: скорость, сила, работа\n"
-        "📸 Фото (отключено в MVP)\n"
+        "📸 Фото\n"
         "🎁 +1 за друга\n"
         "🏆 Лимит 111/день\n\n"
         "Выбери урок, затем отправь задачу.",
@@ -565,35 +618,20 @@ async def error_handler(update: object, context: CallbackContext) -> None:
     """Log the error raised by the bot."""
     logging.error("Exception while handling an update:", exc_info=context.error)
 
-async def main():
-    """Запуск бота через webhook"""
-    # Пересоздаём приложение
-    application = Application.builder().token(TOKEN).build()
+# Запуск
+app = ApplicationBuilder().token(TOKEN).build()
 
-    # === Добавляем все хендлеры ===
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("stats", stats))
-    application.add_handler(CommandHandler("set_limit", set_limit))
-    application.add_handler(CommandHandler("users", list_users))
-    application.add_handler(CallbackQueryHandler(admin_callbacks))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CallbackQueryHandler(check_sub_button, pattern="^check_again$"))
-    application.add_error_handler(error_handler)
-
-    # === Запуск webhook ===
-    port = int(os.environ.get("PORT", 10000))
-    await application.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        url_path=TOKEN,
-        webhook_url=f"https://schoolhelper-1.onrender.com/{TOKEN}"
-    )
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("stats", stats))
+app.add_handler(CommandHandler("set_limit", set_limit))
+app.add_handler(CommandHandler("users", list_users))
+app.add_handler(CallbackQueryHandler(admin_callbacks))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))  # Один хендлер для текста
+app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+app.add_handler(CommandHandler("help", help_command))
+app.add_handler(CallbackQueryHandler(check_sub_button, pattern="^check_again$"))
 
 # Добавляем глобальный обработчик ошибок
 app.add_error_handler(error_handler)
 
-if __name__ == '__main__':
-    import asyncio
-    asyncio.run(main())
+app.run_polling()
