@@ -4,17 +4,16 @@ import io
 import requests
 from datetime import datetime
 from PIL import Image
-# EasyOCR импортируем лениво внутри функции, чтобы экономить память
+# EasyOCR удален для MVP
 import sqlite3
-
-from flask import Flask
-import threading
 
 # Импорт модулей решения задач
 from algebra import solve_equation
+from geometry import solve_geometry
+from physics import solve_physics
 
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, CallbackQueryHandler, CallbackContext
 import json
 from telegram.error import TimedOut, NetworkError, RetryAfter
 import asyncio
@@ -33,27 +32,17 @@ REFERRAL_REWARD = int(os.getenv('REFERRAL_REWARD', 1))
 # Админ ID (замени на свой user_id)
 ADMIN_ID = int(os.getenv('ADMIN_ID'))  # Укажи здесь свой Telegram user_id для админа
 
+# ID канала для проверки подписки (из .env, это -1003173491640)
+CHANNEL_ID = int(os.getenv('CHANNEL_USERNAME'))  # Используем как chat_id канала
+
+# Ссылка на канал (из .env или hardcoded)
+CHANNEL_LINK = "https://t.me/+A9kwpodztGUzOTZi"
+
 if not TOKEN:
     raise ValueError("TOKEN не найден в .env!")
 
 # Логи
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-
-# Настройки OCR из окружения (для экономии памяти на Render можно выключить)
-OCR_ENABLED = os.getenv('OCR_ENABLED', '0') in ('1', 'true', 'True')
-OCR_LANGS = os.getenv('OCR_LANGS', 'en')  # по умолчанию только 'en' для меньшей памяти
-
-_ocr_reader = None
-
-def get_ocr_reader():
-    global _ocr_reader
-    if _ocr_reader is not None:
-        return _ocr_reader
-    # Ленивая загрузка только при первом обращении
-    import easyocr  # импорт здесь, чтобы не грузить модуль при старте
-    langs = [lang.strip() for lang in OCR_LANGS.split(',') if lang.strip()]
-    _ocr_reader = easyocr.Reader(langs, gpu=False)
-    return _ocr_reader
 
 # База данных SQLite
 conn = sqlite3.connect('users.db')
@@ -109,42 +98,59 @@ CREATE TABLE IF NOT EXISTS support_messages (
 ''')
 conn.commit()
 
-# Таблицы для опросов
+# Таблица для настроек (новая)
 cursor.execute('''
-CREATE TABLE IF NOT EXISTS polls (
-    poll_id TEXT PRIMARY KEY,
-    question TEXT,
-    options_json TEXT,
-    total_voter_count INTEGER DEFAULT 0,
-    is_closed INTEGER DEFAULT 0,
-    last_update TEXT
-)
-''')
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS poll_answers (
-    poll_id TEXT,
-    user_id INTEGER,
-    option_ids TEXT,
-    username TEXT,
-    first_name TEXT,
-    PRIMARY KEY (poll_id, user_id)
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value INTEGER DEFAULT 0
 )
 ''')
 conn.commit()
 
-# Основная клавиатура
+# Функции для настроек
+def get_setting(key):
+    cursor.execute('SELECT value FROM settings WHERE key = ?', (key,))
+    row = cursor.fetchone()
+    return row[0] if row else 0  # По умолчанию выключено
+
+def set_setting(key, value):
+    cursor.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (key, value))
+    conn.commit()
+
+# Инициализация настроек по умолчанию (выключены, как в закомментированном коде)
+if get_setting('geometry_enabled') == 0:
+    set_setting('geometry_enabled', 0)
+if get_setting('physics_enabled') == 0:
+    set_setting('physics_enabled', 0)
+
+# Основная клавиатура (динамическая на основе настроек)
 def main_keyboard(is_admin: bool):
-    keyboard = [['Решить задачу'], ['Мой уровень', 'История'], ['Пригласить друга'], ['Поддержка']]
+    geometry_enabled = get_setting('geometry_enabled')
+    physics_enabled = get_setting('physics_enabled')
+    
+    keyboard = [
+        ['Уроки по алгебре'],
+    ]
+    if geometry_enabled:
+        keyboard.append(['Уроки по геометрии'])
+    if physics_enabled:
+        keyboard.append(['Уроки по физике'])
+    
+    keyboard += [
+        ['Мой уровень', 'История'], 
+        ['Пригласить друга'], 
+        ['Поддержка']
+    ]
     if is_admin:
         keyboard.append(['Админ панель'])
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-# Клавиатура админа
+# Клавиатура админа (добавлены кнопки для вкл/выкл)
 def admin_keyboard():
     keyboard = [
         ['Статистика', 'Пользователи'],
-        ['Опросы'],
         ['Все сообщения'],
+        ['Вкл/Выкл Геометрию', 'Вкл/Выкл Физику'],
         ['Назад']
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -219,91 +225,66 @@ async def safe_reply_text(update: Update, text: str, parse_mode=None, reply_mark
         except TimedOut:
             logging.warning(f"TimedOut при отправке сообщения (попытка {attempt + 1}/{max_retries})")
             if attempt < max_retries - 1:
-                await asyncio.sleep(2)  # Ждём 2 секунды перед повторной попыткой
-            else:
-                logging.error("Не удалось отправить сообщение после всех попыток")
-                try:
-                    await update.message.reply_text("⏱️ Время ожидания истекло. Попробуй ещё раз.")
-                except:
-                    pass
-                return False
+                await asyncio.sleep(2 ** attempt)
         except RetryAfter as e:
-            logging.warning(f"RetryAfter: нужно подождать {e.retry_after} секунд")
+            logging.warning(f"RetryAfter: ждем {e.retry_after} секунд")
             await asyncio.sleep(e.retry_after + 1)
-        except NetworkError as e:
-            logging.warning(f"NetworkError при отправке сообщения (попытка {attempt + 1}/{max_retries}): {e}")
+        except NetworkError:
+            logging.warning(f"NetworkError (попытка {attempt + 1}/{max_retries})")
             if attempt < max_retries - 1:
-                await asyncio.sleep(2)
-            else:
-                logging.error("Не удалось отправить сообщение из-за сетевой ошибки")
-                return False
+                await asyncio.sleep(2 ** attempt)
         except Exception as e:
-            logging.error(f"Неожиданная ошибка при отправке сообщения: {e}")
-            return False
+            logging.error(f"Ошибка при отправке: {e}")
+            break
     return False
 
-# Глобальный обработчик ошибок
-async def error_handler(update: object, context):
-    """Обрабатывает ошибки, возникающие в хендлерах"""
-    from telegram.ext import ContextTypes
-    
-    if isinstance(context, ContextTypes.DEFAULT_TYPE):
-        error = context.error
-    else:
-        error = context
-    
-    logging.error(f"Ошибка при обработке обновления: {error}")
-    
-    if isinstance(error, TimedOut):
-        logging.warning("Ошибка таймаута обработана - бот продолжит работу")
-    elif isinstance(error, NetworkError):
-        logging.warning(f"Ошибка сети: {error} - бот продолжит работу")
-    elif isinstance(error, RetryAfter):
-        logging.warning(f"Нужно подождать: {error.retry_after} секунд")
-    else:
-        logging.error(f"Необработанная ошибка: {error}")
+# Функция: Проверка подписки на канал
+async def check_subscription(bot, user_id):
+    try:
+        member = await bot.get_chat_member(CHANNEL_ID, user_id)
+        return member.status in ['member', 'administrator', 'creator']
+    except Exception as e:
+        logging.error(f"Ошибка проверки подписки: {e}")
+        return False
 
-# Функция: Реферальная система
+# Рефералы
 async def referral(update: Update, context):
     user_id = update.message.from_user.id
-    ref_link = f"https://t.me/{context.bot.username}?start=ref_{user_id}"
+    ref_link = f"https://t.me/{context.bot.username}?start={user_id}"
     await update.message.reply_text(
-        f"Пригласи друга — получи +{REFERRAL_REWARD} задачу в день!\n\n"
-        f"Твоя ссылка: {ref_link}\n\n"
-        f"Друг перейдёт — твой лимит навсегда +{REFERRAL_REWARD} задач/день."
+        f'Пригласи друга по ссылке: {ref_link}\n'
+        f'За каждого друга +{REFERRAL_REWARD} задача в день навсегда! 🎁'
     )
 
-# /start с меню, рефералами и опросом
+# Команда /start
 async def start(update: Update, context):
     user = update.message.from_user
     user_id = user.id
     upsert_user_profile(user_id, user.username, user.first_name)
-    args = context.args
     
-    # Если по рефералке
-    if args and args[0].startswith('ref_'):
-        referrer_id = int(args[0].split('_')[1])
+    args = context.args
+    if args and args[0].isdigit():
+        referrer_id = int(args[0])
         if referrer_id != user_id:
             add_extra_tasks(referrer_id, REFERRAL_REWARD)
-            await context.bot.send_message(referrer_id, f"Друг зарегистрировался! Твой лимит +{REFERRAL_REWARD} задач/день навсегда! 🚀")
+            await context.bot.send_message(referrer_id, f'Друг присоединился! +{REFERRAL_REWARD} задача навсегда 🎉')
     
-    # Обычный старт
-    get_user_level(user_id)
-    reply_markup = main_keyboard(user_id == ADMIN_ID)
-    await update.message.reply_text('Salom! Выбери в меню:', reply_markup=reply_markup)
+    is_sub = await check_subscription(context.bot, user_id)
+    if not is_sub:
+        await update.message.reply_text(
+            "Привет! Подпишись на канал для задач без лимита 👇",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Подписаться", url=CHANNEL_LINK)]])
+        )
+        return
     
-    # Опрос при старте
-    await update.message.reply_poll(
-        question="Какой новый предмет добавить?",
-        options=["Kimyo (Химия)", "Geometriya (Геометрия)"],
-        is_anonymous=False,
-        allows_multiple_answers=False
+    await update.message.reply_text(
+        "Добро пожаловать! Выбери урок:",
+        reply_markup=main_keyboard(user_id == ADMIN_ID)
     )
 
-# Команда: /stats (только админ)
+# Команда /stats (для админа)
 async def stats(update: Update, context):
-    user_id = update.message.from_user.id
-    if user_id != ADMIN_ID:
+    if update.message.from_user.id != ADMIN_ID:
         return
     cursor.execute('SELECT COUNT(*), SUM(daily_count), SUM(extra_tasks) FROM users')
     row = cursor.fetchone()
@@ -314,131 +295,23 @@ async def stats(update: Update, context):
         f'Всего extra_tasks: {extra}'
     )
 
-# Обработчик обновлений опросов (агрегированное состояние опроса)
-async def on_poll(update: Update, context):
-    poll = update.poll
-    if not poll:
-        return
-    options = [{'text': opt.text, 'voter_count': opt.voter_count} for opt in poll.options]
-    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    cursor.execute(
-        'INSERT OR REPLACE INTO polls (poll_id, question, options_json, total_voter_count, is_closed, last_update) VALUES (?, ?, ?, ?, ?, ?)',
-        (poll.id, poll.question, json.dumps(options, ensure_ascii=False), poll.total_voter_count, int(poll.is_closed), now)
-    )
-    conn.commit()
-
-# Обработчик ответов пользователей в опросах
-async def on_poll_answer(update: Update, context):
-    ans = update.poll_answer
-    if not ans:
-        return
-    user = ans.user
-    option_ids = json.dumps(ans.option_ids)
-    cursor.execute(
-        'INSERT OR REPLACE INTO poll_answers (poll_id, user_id, option_ids, username, first_name) VALUES (?, ?, ?, ?, ?)',
-        (ans.poll_id, user.id if user else None, option_ids, getattr(user, 'username', None), getattr(user, 'first_name', None))
-    )
-    conn.commit()
-
-# Показ следующего сообщения поддержки администратору
-async def send_next_support_message(update: Update, context, after_id: int | None):
-    if after_id is None:
-        cursor.execute('SELECT id, user_id, username, first_name, text, timestamp FROM support_messages WHERE processed = 0 ORDER BY id ASC LIMIT 1')
-    else:
-        cursor.execute('SELECT id, user_id, username, first_name, text, timestamp FROM support_messages WHERE processed = 0 AND id > ? ORDER BY id ASC LIMIT 1', (after_id,))
-    row = cursor.fetchone()
-    if not row:
-        await update.message.reply_text('Нет новых сообщений.', reply_markup=admin_keyboard())
-        return
-    msg_id, uid, uname, fname, text, ts = row
-    uname_disp = f"@{uname}" if uname else '(нет username)'
-    header = f"ID:{msg_id} | {ts}\nОт: {uid} {uname_disp} {fname or ''}\n\n{text}"
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton('Обработано ✅', callback_data=f'support_done:{msg_id}'),
-            InlineKeyboardButton('Следующее ▶️', callback_data=f'support_next:{msg_id}')
-        ]
-    ])
-    await update.message.reply_text(header, reply_markup=kb)
-
-# Обработчик inline-кнопок админа
-async def admin_callbacks(update: Update, context):
-    query = update.callback_query
-    data = query.data or ''
-    await query.answer()
-    if not data or update.effective_user.id != ADMIN_ID:
-        return
-    if data.startswith('support_done:'):
-        _, sid = data.split(':', 1)
-        try:
-            sid_i = int(sid)
-        except ValueError:
-            return
-        cursor.execute('UPDATE support_messages SET processed = 1 WHERE id = ?', (sid_i,))
-        conn.commit()
-        await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text('Отмечено как обработано.', reply_markup=admin_keyboard())
-    elif data.startswith('support_next:'):
-        _, sid = data.split(':', 1)
-        try:
-            sid_i = int(sid)
-        except ValueError:
-            return
-        # Отправим следующее сообщение
-        dummy_update = Update(update.update_id, message=query.message)
-        await send_next_support_message(dummy_update, context, after_id=sid_i)
-
-# Команда: /set_limit <user_id> <кол-во> (только админ)
+# Команда /set_limit (для админа)
 async def set_limit(update: Update, context):
-    user_id = update.message.from_user.id
-    if user_id != ADMIN_ID:
-        return
-    args = context.args
-    if len(args) != 2:
-        await update.message.reply_text('Формат: /set_limit <user|@username|id> <кол-во>')
+    if update.message.from_user.id != ADMIN_ID:
         return
     try:
-        ref = args[0]
-        # Разрешить id или @username
-        target: int | None = None
-        if ref.startswith('@'):
-            uname = ref[1:]
-            cursor.execute('SELECT user_id FROM users WHERE LOWER(username) = LOWER(?)', (uname,))
-            row = cursor.fetchone()
-            if row:
-                target = int(row[0])
-        else:
-            try:
-                target = int(ref)
-            except ValueError:
-                # Попробуем как username без @
-                cursor.execute('SELECT user_id FROM users WHERE LOWER(username) = LOWER(?)', (ref,))
-                row = cursor.fetchone()
-                if row:
-                    target = int(row[0])
-        if target is None:
-            await update.message.reply_text('Пользователь не найден. Используй /users <поиск> чтобы найти.')
-            return
-        amount = int(args[1])
-        add_extra_tasks(target, amount)
-        await update.message.reply_text(f'Пользователю {target} добавлено {amount} extra_tasks')
-    except ValueError:
-        await update.message.reply_text('Неверный формат. Пример: /set_limit @username 5')
+        user_id, new_limit = map(int, context.args)
+        cursor.execute('UPDATE users SET extra_tasks = ? WHERE user_id = ?', (new_limit, user_id))
+        conn.commit()
+        await update.message.reply_text(f'Extra для {user_id} = {new_limit}')
+    except:
+        await update.message.reply_text('Использование: /set_limit <user_id> <extra>')
 
-# Команда: /users [filter]
+# Команда /users (для админа)
 async def list_users(update: Update, context):
-    user_id = update.message.from_user.id
-    if user_id != ADMIN_ID:
+    if update.message.from_user.id != ADMIN_ID:
         return
-    q = ' '.join(context.args) if context.args else ''
-    if q:
-        like = f"%{q.lower()}%"
-        cursor.execute(
-            'SELECT user_id, username, first_name, extra_tasks FROM users WHERE LOWER(COALESCE(username, "")) LIKE ? OR LOWER(COALESCE(first_name, "")) LIKE ? ORDER BY user_id DESC LIMIT 20',
-            (like, like)
-        )
-    else:
-        cursor.execute('SELECT user_id, username, first_name, extra_tasks FROM users ORDER BY user_id DESC LIMIT 20')
+    cursor.execute('SELECT user_id, username, first_name, extra_tasks FROM users ORDER BY user_id DESC LIMIT 20')
     rows = cursor.fetchall()
     if not rows:
         await update.message.reply_text('Пользователи не найдены.')
@@ -450,16 +323,85 @@ async def list_users(update: Update, context):
         lines.append(f"{uid} — {uname_disp} — {fname_disp} — extra:{extra}")
     await update.message.reply_text('\n'.join(lines))
 
-# Обработчик текста (объединили кнопки и решение)
+# Обработчик callback для админа
+async def admin_callbacks(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data.startswith('processed_'):
+        msg_id = int(data.split('_')[1])
+        cursor.execute('UPDATE support_messages SET processed = 1 WHERE id = ?', (msg_id,))
+        conn.commit()
+        await query.edit_message_text('Сообщение обработано ✅')
+        # Показать следующее
+        await send_next_support_message(query.message, context, after_id=msg_id)  # Используем query.message
+
+# Функция: Показать следующее сообщение поддержки (если есть)
+async def send_next_support_message(message, context, after_id=None):
+    user_id = message.chat.id  # Используем chat.id для админа
+    if user_id != ADMIN_ID:
+        return
+    query = 'SELECT id, user_id, username, first_name, text, timestamp FROM support_messages WHERE processed = 0'
+    if after_id:
+        query += ' AND id > ?'
+        cursor.execute(query + ' ORDER BY id ASC LIMIT 1', (after_id,))
+    else:
+        cursor.execute(query + ' ORDER BY id ASC LIMIT 1')
+    row = cursor.fetchone()
+    if not row:
+        await message.reply_text('Нет новых сообщений.', reply_markup=admin_keyboard())
+        return
+    msg_id, user_id, uname, fname, text, ts = row
+    uname_disp = f"@{uname}" if uname else ''
+    fname_disp = fname or 'Без имени'
+    await message.reply_text(
+        f'Сообщение #{msg_id} от {fname_disp} {uname_disp} ({user_id}) в {ts}:\n{text}',
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Обработано ✅", callback_data=f"processed_{msg_id}")]
+        ])
+    )
+
+# Обработчик текста (перемещена проверка support_mode выше для приоритета)
 async def handle_text(update: Update, context):
-    text = update.message.text
     user = update.message.from_user
     user_id = user.id
     upsert_user_profile(user_id, user.username, user.first_name)
+    text = update.message.text.strip()
     count, limit = get_user_level(user_id)
     
-    if text == 'Решить задачу':
-        await update.message.reply_text('Пришли фото или текст уравнения (например: 2x + 5 = 13)')
+    mode = context.user_data.get('mode')
+    
+    # Проверка support_mode
+    if context.user_data.get('support_mode'):
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        cursor.execute(
+            'INSERT INTO support_messages (user_id, username, first_name, text, timestamp, processed) VALUES (?, ?, ?, ?, ?, 0)',
+            (user_id, user.username, user.first_name, text, timestamp)
+        )
+        conn.commit()
+        context.user_data['support_mode'] = False
+        await update.message.reply_text('Сообщение отправлено администратору. Спасибо!', reply_markup=main_keyboard(user_id == ADMIN_ID))
+        return
+    
+    if text == 'Уроки по алгебре':
+        await safe_reply_text(update, 'Уроки по алгебре: \n1. Линейные: ax + b = 0\n2. Квадратные: ax² + bx + c = 0\n3. Высшие степени\nПример: 2x + 5 = 13\n\nТеперь отправь уравнение или задачу по алгебре для решения.')
+        context.user_data['mode'] = 'algebra'
+        return
+    
+    elif text == 'Уроки по геометрии':
+        if not get_setting('geometry_enabled'):
+            await safe_reply_text(update, 'Геометрия отключена администратором.')
+            return
+        await safe_reply_text(update, 'Уроки по геометрии: \n1. Площадь треугольника: ½ * основание * высота\n2. Площадь круга: π * r²\n3. Теорема Пифагора: c = √(a² + b²)\nПример: площадь треугольника 6 4\n\nТеперь отправь задачу по геометрии.')
+        context.user_data['mode'] = 'geometry'
+        return
+    
+    elif text == 'Уроки по физике':
+        if not get_setting('physics_enabled'):
+            await safe_reply_text(update, 'Физика отключена администратором.')
+            return
+        await safe_reply_text(update, 'Уроки по физике: \n1. Скорость: v = s / t\n2. Сила: F = m * a\n3. Работа: A = F * s\nПример: скорость 100 2\n\nТеперь отправь задачу по физике.')
+        context.user_data['mode'] = 'physics'
         return
     
     elif text == 'Мой уровень':
@@ -511,96 +453,120 @@ async def handle_text(update: Update, context):
             lines.append(f"{uid} — {uname_disp} — {fname_disp} — extra:{extra}")
         await update.message.reply_text('\n'.join(lines), reply_markup=admin_keyboard())
         return
-    elif text == 'Опросы' and user_id == ADMIN_ID:
-        # Показ последних 3 опросов с суммарными результатами
-        cursor.execute('SELECT poll_id, question, options_json, total_voter_count, is_closed, last_update FROM polls ORDER BY last_update DESC LIMIT 3')
-        polls = cursor.fetchall()
-        if not polls:
-            await update.message.reply_text('Опросов пока нет.', reply_markup=admin_keyboard())
-            return
-        blocks = []
-        for poll_id, question, options_json, total, is_closed, ts in polls:
-            try:
-                options = json.loads(options_json or '[]')
-            except:
-                options = []
-            lines = [f'Вопрос: {question}', f'Итоги (всего: {total}, статус: {"закрыт" if is_closed else "открыт"})']
-            for opt in options:
-                lines.append(f"- {opt.get('text', '')}: {opt.get('voter_count', 0)}")
-            lines.append(f"poll_id: {poll_id}")
-            if ts:
-                lines.append(f"обновлено: {ts}")
-            blocks.append('\n'.join(lines))
-        await update.message.reply_text('\n\n'.join(blocks), reply_markup=admin_keyboard())
-        return
     elif text == 'Все сообщения' and user_id == ADMIN_ID:
-        await send_next_support_message(update, context, after_id=None)
+        await send_next_support_message(update.message, context, after_id=None)
         return
     
-    elif context.user_data.get('support_mode'):
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        cursor.execute(
-            'INSERT INTO support_messages (user_id, username, first_name, text, timestamp, processed) VALUES (?, ?, ?, ?, ?, 0)',
-            (user_id, user.username, user.first_name, text, timestamp)
-        )
-        conn.commit()
-        context.user_data['support_mode'] = False
-        await update.message.reply_text('Сообщение отправлено администратору. Спасибо!', reply_markup=main_keyboard(user_id == ADMIN_ID))
+    elif text == 'Вкл/Выкл Геометрию' and user_id == ADMIN_ID:
+        current = get_setting('geometry_enabled')
+        new = 1 - current
+        set_setting('geometry_enabled', new)
+        status = "включена" if new else "выключена"
+        await update.message.reply_text(f'Геометрия {status}.', reply_markup=admin_keyboard())
         return
+    
+    elif text == 'Вкл/Выкл Физику' and user_id == ADMIN_ID:
+        current = get_setting('physics_enabled')
+        new = 1 - current
+        set_setting('physics_enabled', new)
+        status = "включена" if new else "выключена"
+        await update.message.reply_text(f'Физика {status}.', reply_markup=admin_keyboard())
+        return
+    
     elif text == 'Поддержка':
         context.user_data['support_mode'] = True
         await update.message.reply_text('Напиши своё сообщение. Я передам администратору.', reply_markup=main_keyboard(user_id == ADMIN_ID))
         return
-    else:
-        # Решение уравнения
+    
+    # Проверки режимов перемещены сюда, после всех кнопок
+    if mode == 'algebra':
         if count >= limit:
             await safe_reply_text(update, f'Лимит! Пригласи друга за +{REFERRAL_REWARD} задачу в день.')
             return
-        
-        steps, solution = solve_equation(text)
-        await safe_reply_text(update, steps, parse_mode='HTML')
-        
-        if solution:
-            increment_count(user_id)
-            add_to_history(user_id, text, str(solution))
-
-# Фото: Распознать + решить
-async def handle_photo(update: Update, context):
-    user = update.message.from_user
-    user_id = user.id
-    upsert_user_profile(user_id, user.username, user.first_name)
-    count, limit = get_user_level(user_id)
-    
-    if count >= limit:
-        await safe_reply_text(update, f'Лимит! Пригласи друга за +{REFERRAL_REWARD} задачу в день.')
-        return
-    
-    if not OCR_ENABLED:
-        await safe_reply_text(update, 'OCR отключен для экономии памяти. Пришли текст уравнения, пожалуйста.')
-        return
-    photo = await update.message.photo[-1].get_file()
-    photo_url = photo.file_path
-    response = requests.get(photo_url)
-    img = Image.open(io.BytesIO(response.content))
-    
-    try:
-        reader = get_ocr_reader()
-        result = reader.readtext(img)
-        text = ' '.join([detection[1] for detection in result])
-    except Exception as e:
-        logging.error(f"OCR error: {e}")
-        await safe_reply_text(update, 'Не получилось распознать фото. Пришли текст уравнения, пожалуйста.')
-        return
-    
-    if text.strip():
-        await safe_reply_text(update, f"Matn: {text}")
         steps, solution = solve_equation(text)
         await safe_reply_text(update, steps, parse_mode='HTML')
         if solution:
             increment_count(user_id)
             add_to_history(user_id, text, str(solution))
+        return
+    
+    elif mode == 'geometry':
+        if count >= limit:
+            await safe_reply_text(update, f'Лимит! Пригласи друга за +{REFERRAL_REWARD} задачу в день.')
+            return
+        steps, solution = solve_geometry(text)
+        await safe_reply_text(update, steps)
+        if solution:
+            increment_count(user_id)
+            add_to_history(user_id, text, str(solution))
+        return
+    
+    elif mode == 'physics':
+        if count >= limit:
+            await safe_reply_text(update, f'Лимит! Пригласи друга за +{REFERRAL_REWARD} задачу в день.')
+            return
+        steps, solution = solve_physics(text)
+        await safe_reply_text(update, steps)
+        if solution:
+            increment_count(user_id)
+            add_to_history(user_id, text, str(solution))
+        return
+    
     else:
-        await safe_reply_text(update, "Matn topilmadi.")
+        # Нет автоматического решения
+        await safe_reply_text(update, 'Выбери урок, чтобы увидеть объяснение и решить задачу.')
+
+# Фото: Распознать + решить (упрощено без OCR для MVP)
+async def handle_photo(update: Update, context):
+    await safe_reply_text(update, 'Фото-распознавание отключено в MVP. Пришли текст уравнения, пожалуйста.')
+
+# /help
+async def help_command(update: Update, context):
+    await update.message.reply_text(
+        "🔥 <b>SchoolBot — твой помощник!</b>\n\n"
+        "Что умею:\n"
+        "✅ Алгебра: уравнения 5–11 класс\n"
+        "✅ Геометрия: площадь, периметр, Пифагор\n"
+        "✅ Физика: скорость, сила, работа\n"
+        "📸 Фото (отключено в MVP)\n"
+        "🎁 +1 за друга\n"
+        "🏆 Лимит 111/день\n\n"
+        "Выбери урок, затем отправь задачу.",
+        parse_mode='HTML'
+    )
+
+# Кнопка проверки подписки
+async def check_sub_button(update: Update, context):
+    query = update.callback_query
+    await query.answer()
+    is_sub = await check_subscription(context.bot, query.from_user.id)
+    if is_sub:
+        await query.edit_message_text(
+            "✅ Ты в канале! Можешь решать задачи без лимита.\n"
+            "Нажми /start — поехали!",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Обновить", callback_data="check_again")]])
+        )
+    else:
+        await query.edit_message_text("❌ Ты отписался. Подпишись снова 👇", reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Подписаться", url=CHANNEL_LINK)]]
+        ))
+
+# Секретная фраза
+async def secret_phrase(update: Update, context):
+    if update.message.text.strip().lower() == "этат очен харашо":
+        # Замени на реальный стикер ID, если есть
+        # await update.message.reply_sticker("CAACAgIAAxkBAAIBUmcbF...")  
+        await update.message.reply_text(
+            "ЭТО ОЧЕНЬ ХОРОШО! ✅\n"
+            "Ты нашёл пасхалку! +10 задач навсегда 🎉",
+            reply_markup=main_keyboard(update.message.from_user.id == ADMIN_ID)
+        )
+        add_extra_tasks(update.message.from_user.id, 10)
+
+# Глобальный обработчик ошибок
+async def error_handler(update: object, context: CallbackContext) -> None:
+    """Log the error raised by the bot."""
+    logging.error("Exception while handling an update:", exc_info=context.error)
 
 # Запуск
 app = ApplicationBuilder().token(TOKEN).build()
@@ -610,42 +576,12 @@ app.add_handler(CommandHandler("stats", stats))
 app.add_handler(CommandHandler("set_limit", set_limit))
 app.add_handler(CommandHandler("users", list_users))
 app.add_handler(CallbackQueryHandler(admin_callbacks))
-app.add_handler(PollHandler(on_poll))
-app.add_handler(PollAnswerHandler(on_poll_answer))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))  # Один хендлер для текста
 app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+app.add_handler(CommandHandler("help", help_command))
+app.add_handler(CallbackQueryHandler(check_sub_button, pattern="^check_again$"))
 
 # Добавляем глобальный обработчик ошибок
 app.add_error_handler(error_handler)
 
-flask_app = Flask(__name__)
-
-@flask_app.route('/')
-def home():
-    return """
-    <h1>🧮 MathBot работает!</h1>
-    <p>Бот решает уравнения в Telegram</p>
-    <hr>
-    <pre>
-        Пользователей: <b>много</b>
-        Задач сегодня: <b>тысячи</b>
-        Статус: <span style="color:green">ONLINE ✅</span>
-    </pre>
-    <footer>© 2025 | Deploy на Render</footer>
-    """
-
-def run_flask():
-    flask_app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
-
-if __name__ == '__main__':
-    threading.Thread(target=run_flask, daemon=True).start()
-    print("Бот и сайт запущены!")
-    
-    # Новый способ запуска в v21+
-    application = Application.builder().token(TOKEN).build()
-    
-    # Добавь хендлеры (пример)
-    application.add_handler(CommandHandler("start", start))
-    # ... остальные хендлеры
-
-    application.run_polling()
+app.run_polling()
