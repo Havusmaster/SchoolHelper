@@ -565,20 +565,35 @@ async def error_handler(update: object, context: CallbackContext) -> None:
     """Log the error raised by the bot."""
     logging.error("Exception while handling an update:", exc_info=context.error)
 
-# Запуск
-app = ApplicationBuilder().token(TOKEN).build()
+async def main():
+    """Запуск бота через webhook"""
+    # Пересоздаём приложение
+    application = Application.builder().token(TOKEN).build()
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("stats", stats))
-app.add_handler(CommandHandler("set_limit", set_limit))
-app.add_handler(CommandHandler("users", list_users))
-app.add_handler(CallbackQueryHandler(admin_callbacks))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))  # Один хендлер для текста
-app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-app.add_handler(CommandHandler("help", help_command))
-app.add_handler(CallbackQueryHandler(check_sub_button, pattern="^check_again$"))
+    # === Добавляем все хендлеры ===
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("stats", stats))
+    application.add_handler(CommandHandler("set_limit", set_limit))
+    application.add_handler(CommandHandler("users", list_users))
+    application.add_handler(CallbackQueryHandler(admin_callbacks))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CallbackQueryHandler(check_sub_button, pattern="^check_again$"))
+    application.add_error_handler(error_handler)
+
+    # === Запуск webhook ===
+    port = int(os.environ.get("PORT", 10000))
+    await application.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=TOKEN,
+        webhook_url=f"https://schoolhelper-1.onrender.com/{TOKEN}"
+    )
 
 # Добавляем глобальный обработчик ошибок
 app.add_error_handler(error_handler)
 
-app.run_polling()
+if __name__ == '__main__':
+    import asyncio
+    asyncio.run(main())
