@@ -1,10 +1,7 @@
 import logging
 import os
-import io
-import requests
 from datetime import datetime
-from PIL import Image
-# EasyOCR удален для MVP
+# Убраны ненужные импорты: io, requests, PIL.Image
 import sqlite3
 
 # Импорт модулей решения задач
