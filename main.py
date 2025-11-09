@@ -614,6 +614,37 @@ async def secret_phrase(update: Update, context):
         add_extra_tasks(update.message.from_user.id, 10)
 
 # Глобальный обработчик ошибок
-async def error_handler(update: object, context: CallbackContext) -> None:
-    """Log the error raised by the bot."""
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logging.error("Exception while handling an update:", exc_info=context.error)
+
+# === ОСНОВНАЯ ФУНКЦИЯ ===
+async def main():
+    application = Application.builder().token(TOKEN).build()
+
+    # Добавляем хендлеры
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("stats", stats))
+    application.add_handler(CommandHandler("set_limit", set_limit))
+    application.add_handler(CommandHandler("users", list_users))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CallbackQueryHandler(admin_callbacks))
+    application.add_handler(CallbackQueryHandler(check_sub_button, pattern="^check_again$"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_error_handler(error_handler)
+
+    # Webhook
+    port = int(os.environ.get("PORT", 10000))
+    webhook_url = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/{TOKEN}"
+
+    logging.info(f"Запуск webhook: {webhook_url}")
+    
+    await application.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=TOKEN,
+        webhook_url=webhook_url
+    )
+
+if __name__ == '__main__':
+    asyncio.run(main())
