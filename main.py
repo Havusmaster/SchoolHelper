@@ -581,7 +581,7 @@ async def check_sub_button(update: Update, context):
 async def secret_phrase(update: Update, context):
     if update.message.text.strip().lower() == "этат очен харашо":
         # Замени на реальный стикер ID, если есть
-        # await update.message.reply_sticker("CAACAgIAAxkBAAIBUmcbF...")  
+        await update.message.reply_sticker("CAACAgIAAxkBAAEBwLhpEM5SsIYfonz-qReuvBfpAddLrQAC7oQAAtsiyUsNLxvvZ-wqXDYE")  
         await update.message.reply_text(
             "ЭТО ОЧЕНЬ ХОРОШО! ✅\n"
             "Ты нашёл пасхалку! +10 задач навсегда 🎉",
