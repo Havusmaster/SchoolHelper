@@ -617,21 +617,3 @@ async def secret_phrase(update: Update, context):
 async def error_handler(update: object, context: CallbackContext) -> None:
     """Log the error raised by the bot."""
     logging.error("Exception while handling an update:", exc_info=context.error)
-
-# Запуск
-app = ApplicationBuilder().token(TOKEN).build()
-
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("stats", stats))
-app.add_handler(CommandHandler("set_limit", set_limit))
-app.add_handler(CommandHandler("users", list_users))
-app.add_handler(CallbackQueryHandler(admin_callbacks))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))  # Один хендлер для текста
-app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-app.add_handler(CommandHandler("help", help_command))
-app.add_handler(CallbackQueryHandler(check_sub_button, pattern="^check_again$"))
-
-# Добавляем глобальный обработчик ошибок
-app.add_error_handler(error_handler)
-
-app.run_polling()
