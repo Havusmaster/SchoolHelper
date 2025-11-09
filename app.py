@@ -30,7 +30,7 @@ UPTIME_CHECK_URL = f"https://{os.getenv('https://schoolhelper-1', 'localhost')}.
 
 # === FLASK ===
 app = Flask(__name__)
-
+ 
 # === HTML ===
 HTML = """
 <!DOCTYPE html>

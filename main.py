@@ -1,13 +1,8 @@
-# main.py (исправленная версия - фикс threading для SQLite: используем thread-local conn)
+# main.py (исправленная версия - добавлен drop_pending_updates=True для фикса конфликта в polling)
 # Исправления:
-# - Добавил import threading
-# - Добавил db_local = threading.local() и def get_db(): для thread-local conn/cursor.
-# - Убрал глобальный conn = sqlite3.connect(...), cursor = conn.cursor()
-# - Во всех функциях, где используется cursor/conn, добавил conn, cursor = get_db() перед execute, и conn.commit() где нужно.
-# - Переместил создания таблиц и ALTER в def init_db(), вызов в bot_main() после initialize.
-# - Переместил инициализацию настроек (if get_setting... set_setting) в init_db().
-# - В функциях get_setting, set_setting теперь используют get_db().
-# - В add_to_history исправил на solution (было truncated).
+# - В bot_main: await bot_application.updater.start_polling(drop_pending_updates=True)
+# - Это отбросит ожидающие обновления и позволит новому экземпляру работать без конфликта во время деплоя.
+# - Также добавил await bot_application.bot.delete_webhook(drop_pending_updates=True) для очистки.
 # - Остальной код без изменений.
 
 import logging
@@ -49,7 +44,7 @@ ADMIN_ID = int(os.getenv('ADMIN_ID'))  # Укажи здесь свой Telegram
 CHANNEL_ID = int(os.getenv('CHANNEL_ID', os.getenv('CHANNEL_USERNAME')))  # Фикс: Работает с CHANNEL_USERNAME или CHANNEL_ID
 
 # Ссылка на канал (из .env или hardcoded)
-CHANNEL_LINK = "https://t.me/A9kwpodztGUzOTZi"
+CHANNEL_LINK = "https://t.me/+A9kwpodztGUzOTZi"
 
 if not TOKEN:
     raise ValueError("TOKEN не найден в .env!")
@@ -578,26 +573,27 @@ async def error_handler(update: object, context: CallbackContext) -> None:
     logging.error("Exception while handling an update:", exc_info=context.error)
 
 # Запуск
-app = ApplicationBuilder().token(TOKEN).build()
+bot_application = ApplicationBuilder().token(TOKEN).build()
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("stats", stats))
-app.add_handler(CommandHandler("set_limit", set_limit))
-app.add_handler(CommandHandler("users", list_users))
-app.add_handler(CallbackQueryHandler(admin_callbacks))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))  # Один хендлер для текста
-app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-app.add_handler(CommandHandler("help", help_command))
-app.add_handler(CallbackQueryHandler(check_sub_button, pattern="^check_again$"))
+bot_application.add_handler(CommandHandler("start", start))
+bot_application.add_handler(CommandHandler("stats", stats))
+bot_application.add_handler(CommandHandler("set_limit", set_limit))
+bot_application.add_handler(CommandHandler("users", list_users))
+bot_application.add_handler(CallbackQueryHandler(admin_callbacks))
+bot_application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))  # Один хендлер для текста
+bot_application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+bot_application.add_handler(CommandHandler("help", help_command))
+bot_application.add_handler(CallbackQueryHandler(check_sub_button, pattern="^check_again$"))
 
 # Добавляем глобальный обработчик ошибок
-app.add_error_handler(error_handler)
+bot_application.add_error_handler(error_handler)
 
 # Wrapper для запуска в asyncio (фикс ошибки)
 async def bot_main():
-    await app.initialize()
+    await bot_application.initialize()
     init_db()  # Инициализация БД в потоке бота
-    await app.start()
-    await app.updater.start_polling()
+    await bot_application.start()
+    await bot_application.bot.delete_webhook(drop_pending_updates=True)
+    await bot_application.updater.start_polling(drop_pending_updates=True)
     # Ждем бесконечно (для фона)
     await asyncio.Event().wait()
