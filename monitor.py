@@ -8,7 +8,7 @@ import requests
 import asyncio
 
 # Импорт из main.py (переименуй main.py в bot.py или скопируй код)
-from bot import main as main  # Предполагая, что в bot.py есть async def main()
+from main import main as main  # Предполагая, что в bot.py есть async def main()
 
 # === ФОНОВЫЙ ЗАПУСК БОТА ===
 def start_bot():
