@@ -1,12 +1,14 @@
-# main.py (исправленная версия - фикс indentation и реализовал недостающие функции из оригинала)
+# main.py (исправленная версия - фикс threading для SQLite: используем thread-local conn)
 # Исправления:
-# - Добавил тело для async def send_next_support_message(...) на основе логики поддержки (из оригинального описания).
-# - Добавил тело для async def admin_callbacks(...) для обработки кнопок "Обработано" и "Следующее".
-# - Добавил обработку support_mode в начале handle_text (сохранение сообщения в БД).
-# - Добавил вызов secret_phrase в handle_text если текст == "этат очен харашо" (поскольку handler не добавлен).
-# - Убрал async def safe_reply_text из indented блока (оно было после комментария, но теперь правильно).
-# - Фикс: В add_to_history добавил недостающий параметр solution (был truncated).
-# - Остальной код без изменений, только фиксы ошибок.
+# - Добавил import threading
+# - Добавил db_local = threading.local() и def get_db(): для thread-local conn/cursor.
+# - Убрал глобальный conn = sqlite3.connect(...), cursor = conn.cursor()
+# - Во всех функциях, где используется cursor/conn, добавил conn, cursor = get_db() перед execute, и conn.commit() где нужно.
+# - Переместил создания таблиц и ALTER в def init_db(), вызов в bot_main() после initialize.
+# - Переместил инициализацию настроек (if get_setting... set_setting) в init_db().
+# - В функциях get_setting, set_setting теперь используют get_db().
+# - В add_to_history исправил на solution (было truncated).
+# - Остальной код без изменений.
 
 import logging
 import os
@@ -16,6 +18,7 @@ from datetime import datetime
 from PIL import Image
 # EasyOCR импортируем лениво внутри функции, чтобы экономить память
 import sqlite3
+import threading
 
 # Импорт модулей решения задач
 from algebra import solve_equation
@@ -70,84 +73,86 @@ def get_ocr_reader():
     _ocr_reader = easyocr.Reader(langs, gpu=False)
     return _ocr_reader
 
-# База данных SQLite
-conn = sqlite3.connect('users.db')
-cursor = conn.cursor()
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    daily_count INTEGER DEFAULT 0,
-    last_date TEXT,
-    extra_tasks INTEGER DEFAULT 0
-)
-''')
-try:
-    cursor.execute("ALTER TABLE users ADD COLUMN extra_tasks INTEGER DEFAULT 0")
+# Thread-local для DB
+db_local = threading.local()
+
+def get_db():
+    if not hasattr(db_local, 'conn'):
+        db_local.conn = sqlite3.connect('users.db')
+        db_local.cursor = db_local.conn.cursor()
+    return db_local.conn, db_local.cursor
+
+# Инициализация БД (таблицы, колонки, настройки)
+def init_db():
+    conn, cursor = get_db()
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        daily_count INTEGER DEFAULT 0,
+        last_date TEXT,
+        extra_tasks INTEGER DEFAULT 0
+    )
+    ''')
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN extra_tasks INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # Колонка уже существует
+
+    # Доп. колонки профиля пользователя
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN username TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN first_name TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        timestamp TEXT,
+        equation TEXT,
+        solution TEXT
+    )
+    ''')
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS support_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        username TEXT,
+        first_name TEXT,
+        text TEXT,
+        timestamp TEXT,
+        processed INTEGER DEFAULT 0
+    )
+    ''')
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value INTEGER DEFAULT 0
+    )
+    ''')
     conn.commit()
-except sqlite3.OperationalError:
-    pass  # Колонка уже существует
 
-# Доп. колонки профиля пользователя
-try:
-    cursor.execute("ALTER TABLE users ADD COLUMN username TEXT")
-    conn.commit()
-except sqlite3.OperationalError:
-    pass
-try:
-    cursor.execute("ALTER TABLE users ADD COLUMN first_name TEXT")
-    conn.commit()
-except sqlite3.OperationalError:
-    pass
-
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    timestamp TEXT,
-    equation TEXT,
-    solution TEXT
-)
-''')
-conn.commit()
-
-# Таблица для сообщений поддержки
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS support_messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    username TEXT,
-    first_name TEXT,
-    text TEXT,
-    timestamp TEXT,
-    processed INTEGER DEFAULT 0
-)
-''')
-conn.commit()
-
-# Таблица для настроек (новая)
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS settings (
-    key TEXT PRIMARY KEY,
-    value INTEGER DEFAULT 0
-)
-''')
-conn.commit()
+    # Инициализация настроек по умолчанию
+    if get_setting('geometry_enabled') == 0:
+        set_setting('geometry_enabled', 0)
+    if get_setting('physics_enabled') == 0:
+        set_setting('physics_enabled', 0)
 
 # Функции для настроек
 def get_setting(key):
+    conn, cursor = get_db()
     cursor.execute('SELECT value FROM settings WHERE key = ?', (key,))
     row = cursor.fetchone()
     return row[0] if row else 0  # По умолчанию выключено
 
 def set_setting(key, value):
+    conn, cursor = get_db()
     cursor.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (key, value))
     conn.commit()
-
-# Инициализация настроек по умолчанию (выключены, как в закомментированном коде)
-if get_setting('geometry_enabled') == 0:
-    set_setting('geometry_enabled', 0)
-if get_setting('physics_enabled') == 0:
-    set_setting('physics_enabled', 0)
 
 # Основная клавиатура (динамическая на основе настроек)
 def main_keyboard(is_admin: bool):
@@ -183,6 +188,7 @@ def admin_keyboard():
 
 # Функция: Получить/обновить пользователя
 def get_user_level(user_id):
+    conn, cursor = get_db()
     today = datetime.now().strftime('%Y-%m-%d')
     cursor.execute('SELECT daily_count, last_date, extra_tasks FROM users WHERE user_id = ?', (user_id,))
     row = cursor.fetchone()
@@ -202,6 +208,7 @@ def get_user_level(user_id):
 
 # Обновить имя/юзернейм пользователя в базе
 def upsert_user_profile(user_id: int, username: str | None, first_name: str | None):
+    conn, cursor = get_db()
     cursor.execute('SELECT 1 FROM users WHERE user_id = ?', (user_id,))
     exists = cursor.fetchone() is not None
     if exists:
@@ -219,16 +226,19 @@ def upsert_user_profile(user_id: int, username: str | None, first_name: str | No
 
 # Функция: Увеличить счётчик
 def increment_count(user_id):
+    conn, cursor = get_db()
     cursor.execute('UPDATE users SET daily_count = daily_count + 1 WHERE user_id = ?', (user_id,))
     conn.commit()
 
 # Функция: Добавить extra_tasks за реферала или админа
 def add_extra_tasks(user_id, amount):
+    conn, cursor = get_db()
     cursor.execute('UPDATE users SET extra_tasks = extra_tasks + ? WHERE user_id = ?', (amount, user_id))
     conn.commit()
 
 # Функция: Добавить в историю
 def add_to_history(user_id, equation, solution):
+    conn, cursor = get_db()
     timestamp = datetime.now().isoformat()
     cursor.execute('INSERT INTO history (user_id, timestamp, equation, solution) VALUES (?, ?, ?, ?)',
                    (user_id, timestamp, equation, solution))
@@ -271,6 +281,7 @@ async def check_subscription(bot, user_id):
 async def stats(update: Update, context):
     if update.message.from_user.id != ADMIN_ID:
         return
+    conn, cursor = get_db()
     cursor.execute('SELECT COUNT(*) FROM users')
     total_users = cursor.fetchone()[0]
     cursor.execute('SELECT SUM(daily_count) FROM users')
@@ -294,6 +305,7 @@ async def set_limit(update: Update, context):
 async def list_users(update: Update, context):
     if update.message.from_user.id != ADMIN_ID:
         return
+    conn, cursor = get_db()
     cursor.execute('SELECT user_id, daily_count, extra_tasks FROM users')
     users = cursor.fetchall()
     text = '\n'.join([f'{u[0]}: {u[1]}/{DAILY_LIMIT + u[2]}' for u in users])
@@ -303,6 +315,7 @@ async def list_users(update: Update, context):
 async def admin_callbacks(update: Update, context):
     query = update.callback_query
     data = query.data
+    conn, cursor = get_db()
     if data.startswith('processed_'):
         msg_id = int(data.split('_')[1])
         cursor.execute('UPDATE support_messages SET processed = 1 WHERE id = ?', (msg_id,))
@@ -315,6 +328,7 @@ async def admin_callbacks(update: Update, context):
 
 # Функция отправки сообщений поддержки (с next)
 async def send_next_support_message(message, context, after_id=None):
+    conn, cursor = get_db()
     cursor.execute('SELECT id, user_id, username, first_name, text FROM support_messages WHERE processed = 0 AND id > ? ORDER BY id ASC LIMIT 1', (after_id or 0,))
     row = cursor.fetchone()
     if row:
@@ -350,6 +364,7 @@ async def handle_text(update: Update, context):
     mode = context.user_data.get('mode', None)
 
     if context.user_data.get('support_mode', False):
+        conn, cursor = get_db()
         timestamp = datetime.now().isoformat()
         cursor.execute('INSERT INTO support_messages (user_id, username, first_name, text, timestamp) VALUES (?, ?, ?, ?, ?)',
                        (user_id, user.username, user.first_name, text, timestamp))
@@ -384,6 +399,7 @@ async def handle_text(update: Update, context):
         await safe_reply_text(update, f'Задач сегодня: {count}/{limit}')
         return
     elif text == 'История':
+        conn, cursor = get_db()
         cursor.execute('SELECT equation, solution FROM history WHERE user_id = ? ORDER BY id DESC LIMIT 5', (user_id,))
         hist = cursor.fetchall()
         lines = [f'{eq}: {sol}' for eq, sol in hist]
@@ -402,6 +418,7 @@ async def handle_text(update: Update, context):
         await stats(update, context)
         return
     elif text == 'Пользователи' and user_id == ADMIN_ID:
+        conn, cursor = get_db()
         cursor.execute('SELECT user_id, username, first_name, extra_tasks FROM users')
         rows = cursor.fetchall()
         lines = []
@@ -579,6 +596,7 @@ app.add_error_handler(error_handler)
 # Wrapper для запуска в asyncio (фикс ошибки)
 async def bot_main():
     await app.initialize()
+    init_db()  # Инициализация БД в потоке бота
     await app.start()
     await app.updater.start_polling()
     # Ждем бесконечно (для фона)
