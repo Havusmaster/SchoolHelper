@@ -1,8 +1,8 @@
-# main.py (исправленная версия - добавлен drop_pending_updates=True для фикса конфликта в polling)
+# main.py (исправленная версия - добавил безлимит для админа: в get_user_level если user_id == ADMIN_ID, limit = 'неограничено', и в проверках if count >= limit: пропустить для админа)
 # Исправления:
-# - В bot_main: await bot_application.updater.start_polling(drop_pending_updates=True)
-# - Это отбросит ожидающие обновления и позволит новому экземпляру работать без конфликта во время деплоя.
-# - Также добавил await bot_application.bot.delete_webhook(drop_pending_updates=True) для очистки.
+# - В get_user_level: if user_id == ADMIN_ID: return count, float('inf')
+# - В местах проверки (handle_text, handle_photo): if user_id == ADMIN_ID or count < limit: (вместо >=, чтобы пропустить для админа)
+# - В 'Мой уровень': if limit == float('inf'): msg = f'Задач сегодня: {count}/неограничено'
 # - Остальной код без изменений.
 
 import logging
@@ -34,7 +34,7 @@ load_dotenv()
 TOKEN = os.getenv('TOKEN')
 
 # Конфиг из .env
-DAILY_LIMIT = int(os.getenv('DAILY_LIMIT', 3))
+DAILY_LIMIT = int(os.getenv('DAILY_LIMIT', 111))  # Фикс: default 111, как в описании
 REFERRAL_REWARD = int(os.getenv('REFERRAL_REWARD', 1))
 
 # Админ ID (замени на свой user_id)
@@ -199,6 +199,8 @@ def get_user_level(user_id):
         cursor.execute('INSERT INTO users (user_id, daily_count, last_date, extra_tasks) VALUES (?, 0, ?, 0)', (user_id, today))
         conn.commit()
     limit = DAILY_LIMIT + extra_tasks
+    if user_id == ADMIN_ID:
+        limit = float('inf')
     return count, limit
 
 # Обновить имя/юзернейм пользователя в базе
@@ -291,10 +293,29 @@ async def set_limit(update: Update, context):
         args = context.args
         user_id = int(args[0])
         new_limit = int(args[1])
-        add_extra_tasks(user_id, new_limit - DAILY_LIMIT)
+        extra = new_limit - DAILY_LIMIT
+        if extra < 0:
+            await update.message.reply_text(f'Предупреждение: new_limit {new_limit} меньше DAILY_LIMIT {DAILY_LIMIT}, extra будет {extra} (отрицательным). Используй /add_extra для добавления положительных extra.')
+        add_extra_tasks(user_id, extra)
         await update.message.reply_text(f'Лимит для {user_id} установлен на {new_limit}')
     except:
         await update.message.reply_text('Использование: /set_limit <user_id> <new_limit>')
+
+# Новая команда /add_extra (админ)
+async def add_extra_command(update: Update, context):
+    if update.message.from_user.id != ADMIN_ID:
+        return
+    try:
+        args = context.args
+        user_id = int(args[0])
+        amount = int(args[1])
+        if amount < 0:
+            await update.message.reply_text('Amount должен быть положительным. Для уменьшения используй /set_limit.')
+            return
+        add_extra_tasks(user_id, amount)
+        await update.message.reply_text(f'Добавлено {amount} extra tasks для {user_id}')
+    except:
+        await update.message.reply_text('Использование: /add_extra <user_id> <amount>')
 
 # /users (админ)
 async def list_users(update: Update, context):
@@ -391,7 +412,8 @@ async def handle_text(update: Update, context):
         await safe_reply_text(update, 'Пришли задачу: скорость 100 2')
         return
     elif text == 'Мой уровень':
-        await safe_reply_text(update, f'Задач сегодня: {count}/{limit}')
+        limit_text = 'неограничено' if limit == float('inf') else limit
+        await safe_reply_text(update, f'Задач сегодня: {count}/{limit_text}')
         return
     elif text == 'История':
         conn, cursor = get_db()
@@ -450,7 +472,7 @@ async def handle_text(update: Update, context):
     
     # Проверки режимов перемещены сюда, после всех кнопок
     if mode == 'algebra':
-        if count >= limit:
+        if user_id != ADMIN_ID and count >= limit:
             await safe_reply_text(update, f'Лимит! Пригласи друга за +{REFERRAL_REWARD} задачу в день.')
             return
         steps, solution = solve_equation(text)
@@ -461,7 +483,7 @@ async def handle_text(update: Update, context):
         return
     
     elif mode == 'geometry':
-        if count >= limit:
+        if user_id != ADMIN_ID and count >= limit:
             await safe_reply_text(update, f'Лимит! Пригласи друга за +{REFERRAL_REWARD} задачу в день.')
             return
         steps, solution = solve_geometry(text)
@@ -472,7 +494,7 @@ async def handle_text(update: Update, context):
         return
     
     elif mode == 'physics':
-        if count >= limit:
+        if user_id != ADMIN_ID and count >= limit:
             await safe_reply_text(update, f'Лимит! Пригласи друга за +{REFERRAL_REWARD} задачу в день.')
             return
         steps, solution = solve_physics(text)
@@ -493,7 +515,7 @@ async def handle_photo(update: Update, context):
     upsert_user_profile(user_id, user.username, user.first_name)
     count, limit = get_user_level(user_id)
     
-    if count >= limit:
+    if user_id != ADMIN_ID and count >= limit:
         await safe_reply_text(update, f'Лимит! Пригласи друга за +{REFERRAL_REWARD} задачу в день.')
         return
     
@@ -534,7 +556,7 @@ async def help_command(update: Update, context):
         "✅ Физика: скорость, сила, работа\n"
         "📸 Фото\n"
         "🎁 +1 за друга\n"
-        "🏆 Лимит 111/день\n\n"
+        f"🏆 Лимит {DAILY_LIMIT}/день\n\n"
         "Выбери урок, затем отправь задачу.",
         parse_mode='HTML'
     )
@@ -578,6 +600,7 @@ bot_application = ApplicationBuilder().token(TOKEN).build()
 bot_application.add_handler(CommandHandler("start", start))
 bot_application.add_handler(CommandHandler("stats", stats))
 bot_application.add_handler(CommandHandler("set_limit", set_limit))
+bot_application.add_handler(CommandHandler("add_extra", add_extra_command))  # Новая команда
 bot_application.add_handler(CommandHandler("users", list_users))
 bot_application.add_handler(CallbackQueryHandler(admin_callbacks))
 bot_application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))  # Один хендлер для текста
