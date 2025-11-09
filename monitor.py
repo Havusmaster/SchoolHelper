@@ -1,10 +1,20 @@
-# monitor.py - Только мониторинг (Flask, без Telegram)
+# monitor.py - Мониторинг + запуск бота в фоне
 import os
 import sqlite3
 from flask import Flask, render_template_string, jsonify
 import threading
 import time
 import requests
+import asyncio
+
+# Импорт из main.py (переименуй main.py в bot.py или скопируй код)
+from bot import main as bot_main  # Предполагая, что в bot.py есть async def main()
+
+# === ФОНОВЫЙ ЗАПУСК БОТА ===
+def start_bot():
+    asyncio.run(bot_main())
+
+threading.Thread(target=start_bot, daemon=True).start()
 
 # === НАСТРОЙКИ ===
 DB_PATH = 'users.db'
@@ -15,6 +25,7 @@ UPTIME_CHECK_URL = f"https://{os.getenv('https://schoolhelper-1.onrender.com', '
 # === FLASK ===
 app = Flask(__name__)
 
+# === HTML ===
 HTML = """
 <!DOCTYPE html>
 <html lang="ru">
@@ -78,7 +89,7 @@ def index():
 
 @app.route('/api/status')
 def api_status():
-    # Проверка бота
+    # Проверка Telegram API
     bot_alive = False
     try:
         resp = requests.get(BOT_URL, timeout=5)
@@ -107,17 +118,20 @@ def api_status():
         'total_extra': total_extra
     })
 
-# === ПИНГ ===
+# === ФОНОВЫЙ ПИНГ (чтобы не засыпал) ===
 def keep_awake():
     while True:
         try:
             requests.get(UPTIME_CHECK_URL, timeout=5)
         except:
             pass
-        time.sleep(300)
+        time.sleep(300)  # каждые 5 минут
 
 # === ЗАПУСК ===
 if __name__ == '__main__':
+    # Запускаем пинг в фоне
     threading.Thread(target=keep_awake, daemon=True).start()
+
+    # Запуск Flask
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
