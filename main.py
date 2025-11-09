@@ -635,7 +635,7 @@ async def main():
 
     # Webhook
     port = int(os.environ.get("PORT", 10000))
-    webhook_url = f"https://{os.environ.get('RENDER_EXTERNAL_HOSTNAME')}/{TOKEN}"
+    webhook_url = f"https://{os.environ.get('https://schoolhelper-1.onrender.com')}/{TOKEN}"
 
     logging.info(f"Запуск webhook: {webhook_url}")
     

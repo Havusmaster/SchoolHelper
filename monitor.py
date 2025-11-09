@@ -10,7 +10,7 @@ import requests
 DB_PATH = 'users.db'
 BOT_TOKEN = os.getenv('TOKEN')
 BOT_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
-UPTIME_CHECK_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME', 'localhost')}"
+UPTIME_CHECK_URL = f"https://{os.getenv('https://schoolhelper-1.onrender.com', 'localhost')}"
 
 # === FLASK ===
 app = Flask(__name__)
