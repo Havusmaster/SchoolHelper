@@ -8,11 +8,11 @@ import requests
 import asyncio
 
 # Импорт из main.py (переименуй main.py в bot.py или скопируй код)
-from bot import main as bot_main  # Предполагая, что в bot.py есть async def main()
+from bot import main as main  # Предполагая, что в bot.py есть async def main()
 
 # === ФОНОВЫЙ ЗАПУСК БОТА ===
 def start_bot():
-    asyncio.run(bot_main())
+    asyncio.run(main())
 
 threading.Thread(target=start_bot, daemon=True).start()
 
