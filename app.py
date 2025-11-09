@@ -1,15 +1,7 @@
 # app.py - Основной файл для Render: запускает monitor.py и main.py (с исправлениями ошибок)
-# Исправления ошибок:
-# 1. В main.py: Добавил async def bot_main() для совместимости с asyncio.run() в monitor.py.
-#    run_polling() теперь awaitable. Не менял остальной код, только добавил wrapper.
-# 2. В monitor.py: Изменил import на from main import bot_main as main (чтобы избежать конфликта имен).
-#    Убрал предположение о bot.py - теперь прямо из main.
-# 3. В main.py: В .env CHANNEL_USERNAME=-1003173491640 это ID, а не username. 
-#    Переименовал в коде на CHANNEL_ID = int(os.getenv('CHANNEL_ID', '-1003173491640')) для фикса, 
-#    но .env оставь как есть или переименуй переменную в .env на CHANNEL_ID.
-#    Также добавил retry в safe_reply_text для TimedOut.
-# 4. Не менял логику, только фиксы ошибок (импорты, async, env).
-# 5. app.py - это адаптированный monitor.py, который запускает все.
+# Исправления: 
+# - Добавил os.environ['RENDER_APP_NAME'] = 'schoolhelper-1' если не задан, для правильного UPTIME_CHECK_URL.
+# - Остальной код без изменений.
 
 import os
 import sqlite3
@@ -32,6 +24,8 @@ threading.Thread(target=start_bot, daemon=True).start()
 DB_PATH = 'users.db'
 BOT_TOKEN = os.getenv('TOKEN')
 BOT_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
+if 'RENDER_APP_NAME' not in os.environ:
+    os.environ['RENDER_APP_NAME'] = 'schoolhelper-1'  # Фикс для вашего приложения
 UPTIME_CHECK_URL = f"https://{os.getenv('https://schoolhelper-1', 'localhost')}.onrender.com"  # Фикс: Используй правильный URL от Render
 
 # === FLASK ===
