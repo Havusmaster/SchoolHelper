@@ -26,7 +26,7 @@ BOT_TOKEN = os.getenv('TOKEN')
 BOT_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/getMe"
 if 'RENDER_APP_NAME' not in os.environ:
     os.environ['RENDER_APP_NAME'] = 'schoolhelper-1'  # Фикс для вашего приложения
-UPTIME_CHECK_URL = f"https://{os.getenv('https://schoolhelper-1', 'localhost')}.onrender.com"  # Фикс: Используй правильный URL от Render
+UPTIME_CHECK_URL = f"https://{os.getenv('schoolhelper-1', 'localhost')}.onrender.com"  # Фикс: Используй правильный URL от Render
 
 # === FLASK ===
 app = Flask(__name__)
