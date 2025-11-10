@@ -44,7 +44,7 @@ ADMIN_ID = int(os.getenv('ADMIN_ID'))  # Укажи здесь свой Telegram
 CHANNEL_ID = int(os.getenv('CHANNEL_ID', os.getenv('CHANNEL_USERNAME')))  # Фикс: Работает с CHANNEL_USERNAME или CHANNEL_ID
 
 # Ссылка на канал (из .env или hardcoded)
-CHANNEL_LINK = "https://t.me/+A9kwpodztGUzOTZi"
+CHANNEL_LINK = "https://t.me/A9kwpodztGUzOTZi"
 
 if not TOKEN:
     raise ValueError("TOKEN не найден в .env!")
