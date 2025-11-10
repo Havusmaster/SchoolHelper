@@ -53,7 +53,7 @@ if not TOKEN:
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 # Настройки OCR из окружения (для экономии памяти на Render можно выключить)
-OCR_ENABLED = os.getenv('OCR_ENABLED', '1') in ('1', 'true', 'True')
+OCR_ENABLED = os.getenv('OCR_ENABLED', '0') in ('1', 'true', 'True')
 OCR_LANGS = os.getenv('OCR_LANGS', 'en')  # по умолчанию только 'en' для меньшей памяти
 
 _ocr_reader = None
