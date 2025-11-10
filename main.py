@@ -579,7 +579,7 @@ async def check_sub_button(update: Update, context):
 
 # Секретная фраза
 async def secret_phrase(update: Update, context):
-    if update.message.text.strip().lower() == "этат очен харашо":
+    if update.message.text.strip().lower() == "Yaratuvchi Sarvar:)":
         # Замени на реальный стикер ID, если есть
         await update.message.reply_sticker("CAACAgIAAxkBAAETzhRpEidOMBqXA0KS5ucH0xMB_roVJAACxIgAAhPVyUvG6NH1lK4xbjYE")  
         await update.message.reply_text(
