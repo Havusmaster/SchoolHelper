@@ -1,15 +1,12 @@
-# main.py
+# main.py — Только настройка бота (для импорта в server.py)
 import logging
 import os
 import io
-import requests
 from PIL import Image
 import easyocr
-import asyncio
-from datetime import datetime
 
 from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -99,11 +96,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         increment_count(user_id)
         add_to_history(user_id, text, str(solution))
 
-app = ApplicationBuilder().token(TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-
-if __name__ == "__main__":
-    print("Бот запущен...")
-    app.run_polling()
+# Строим приложение (без run_polling!)
+telegram_app = Application.builder().token(TOKEN).build()
+telegram_app.add_handler(CommandHandler("start", start))
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+telegram_app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
